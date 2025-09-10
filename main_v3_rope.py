@@ -18,13 +18,12 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import get_cosine_schedule_with_warmup
 
 # 本地自定义模块
-from baseline_model_v3_infonce import BaselineModel as DownstreamModel
+from baseline_model_v3_infonce_rope import BaselineModel as DownstreamModel
 from infer_class_v1 import Infer
-# from my_dataset_preprocess import MMPBaseDataset as BaseDataset
-from my_dataset_v1_aug import BaseDataset
+from my_dataset_preprocess import MMPBaseDataset as BaseDataset
 # from my_dataset_v1 import TrainDataset, ValidDataset
 from my_dataset_v1_aug import TrainDataset, ValidDataset
-from utils import set_environment, format_time
+from utils import analyze_top_level_layers, set_environment, format_time
 
 set_environment()
 
@@ -50,7 +49,7 @@ def get_args():
 
     # ================== 训练优化参数 ==================
     parser.add_argument('--num_epochs', type=int, default=5, help='训练总轮数')
-    parser.add_argument('--lr', type=float, default=1e-3, help='下游任务学习率')
+    parser.add_argument('--lr', type=float, default=1e-2, help='下游任务学习率')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='权重衰减（AdamW 等优化器使用）')
 
     # ================== 运行环境 ==================
@@ -377,8 +376,9 @@ def main():
             print(f"⚠️ 权重加载失败: {e}")
 
     # 模型训练
-    train_downstream_model(downstream_model, train_dataset, valid_dataset, args, writer, valid_dataset_valid, train_dataset_valid)
+    analyze_top_level_layers(downstream_model)
 
+    train_downstream_model(downstream_model, train_dataset, valid_dataset, args, writer, valid_dataset_valid, train_dataset_valid)
     # 加载最佳模型权重
     try:
         path = Path(os.environ.get('USER_CACHE_PATH')) / args.train_name

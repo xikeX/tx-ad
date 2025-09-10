@@ -13,6 +13,13 @@ from dataset import save_emb
 from utils import format_time
 
 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+
+
 def info_nce_loss(anchor, positive, anchor_mask=None, negatives=None,weight=None, temperature=0.07, use_inbatch_negatives=True):
     """
     InfoNCE Loss 支持：
@@ -53,17 +60,17 @@ def info_nce_loss(anchor, positive, anchor_mask=None, negatives=None,weight=None
         # 除了本样本之外所有的其他样本作为负样本
         # 创建 mask，去掉对角线（正样本）
         # anchor_mask = [1,1,1,2,2,3,3,3]
-        # 变
-        # [T,T,T,F,F,F,F,F]
-        # [T,T,T,F,F,F,F,F]
-        # [T,T,T,F,F,F,F,F]
-        # [F,F,F,T,T,F,F,F]
         mask = torch.eye(batch_size, dtype=torch.bool, device=device)
         if anchor_mask is not None:
             batch_mask = (anchor_mask.unsqueeze(0) == anchor_mask.unsqueeze(1)) 
             mask = mask & batch_mask
         inbatch_neg_sim = inbatch_sim.masked_select(~mask).view(batch_size, -1)  # (N, N-1)
         neg_sim_list.append(inbatch_neg_sim)
+        
+        # anchor 和anchor 派出自己
+        input_sim = torch.matmul(anchor, anchor.T)
+        input_neg_sim = input_sim.masked_select(~mask).view(batch_size, -1)  # (N, N-1)
+        neg_sim_list.append(input_neg_sim)
 
     # 拼接所有负样本相似度
     if neg_sim_list:
@@ -83,69 +90,135 @@ def info_nce_loss(anchor, positive, anchor_mask=None, negatives=None,weight=None
     return loss.mean(), pos_sim.mean(), neg_sim.mean()
 
 
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, freqs_cis,device):
+    """
+    Apply rotary position embedding to q and k.
+
+    Args:
+        q: (B, H, T, D)
+        k: (B, H, T, D)
+        freqs_cis: (T, D) complex64 tensor, precomputed
+
+    Returns:
+        q_embed: same shape as q
+        k_embed: same shape as k
+    """
+    # q, k: [B, H, T, D]
+    # freqs_cis: [T, D]
+
+    T = q.size(-2)
+    freqs_cis = freqs_cis[:T].unsqueeze(0).unsqueeze(1)  # [1, 1, T, D]
+
+    # Reshape q and k to (B, H, T, D//2, 2) for complex multiplication
+    q_ = q.float().reshape(*q.shape[:-1], -1, 2)
+    k_ = k.float().reshape(*k.shape[:-1], -1, 2)
+
+    # Convert to complex number
+    q_cis = torch.view_as_complex(q_).to(device)
+    k_cis = torch.view_as_complex(k_).to(device)
+
+    # Apply rotation: q * freqs_cis
+    q_out = torch.view_as_real(q_cis * freqs_cis).flatten(-2)
+    k_out = torch.view_as_real(k_cis * freqs_cis).flatten(-2)
+
+    return q_out.type_as(q), k_out.type_as(k)
 
 
-class FlashMultiHeadAttention(torch.nn.Module):
-    def __init__(self, hidden_units, num_heads, dropout_rate):
+class FlashMultiHeadAttention(nn.Module):
+    def __init__(self, hidden_units, num_heads, dropout_rate, max_seq_len=102, device = None):
         super(FlashMultiHeadAttention, self).__init__()
 
         self.hidden_units = hidden_units
         self.num_heads = num_heads
         self.head_dim = hidden_units // num_heads
         self.dropout_rate = dropout_rate
-
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
 
-        self.q_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.k_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
+        self.q_linear = nn.Linear(hidden_units, hidden_units)
+        self.k_linear = nn.Linear(hidden_units, hidden_units)
+        self.v_linear = nn.Linear(hidden_units, hidden_units)
+        self.out_linear = nn.Linear(hidden_units, hidden_units)
 
-    def forward(self, query, key, value, attn_mask=None):
+        # 预计算 freqs_cis (复数形式)
+        self.freqs_cis = self.precompute_freqs_cis(self.head_dim, max_seq_len)
+        self.freqs_cis = self.freqs_cis.to(self.device)
+
+    def precompute_freqs_cis(self, dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+        """
+        预计算复数频率张量 freqs_cis
+        """
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+        t = torch.arange(end)  # positions 0 to end-1
+        freqs = torch.outer(t, freqs).float()  # (end, dim//2)
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64, (end, dim//2)
+        return freqs_cis
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        前向传播
+        """
         batch_size, seq_len, _ = query.size()
 
-        # 计算Q, K, V
+        # 计算 Q, K, V
         Q = self.q_linear(query)
         K = self.k_linear(key)
         V = self.v_linear(value)
 
-        # reshape为multi-head格式
-        Q = Q.view(batch_size, seq_len, self.num_heads,
-                   self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads,
-                   self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads,
-                   self.head_dim).transpose(1, 2)
+        # reshape 为 multi-head 格式: [B, H, T, D]
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 归一化（可选，与你的原始代码保持一致）
         Q = F.normalize(Q, p=2, dim=-1)
         K = F.normalize(K, p=2, dim=-1)
+
+        # 应用 RoPE
+        Q, K = apply_rotary_pos_emb(Q, K, self.freqs_cis,self.device)
+
+        # 使用 PyTorch 内置的 Flash Attention（高性能）
         if hasattr(F, 'scaled_dot_product_attention'):
-            # PyTorch 2.0+ 使用内置的Flash Attention
             attn_output = F.scaled_dot_product_attention(
-                Q, K, V, dropout_p=self.dropout_rate if self.training else 0.0, attn_mask=attn_mask.unsqueeze(1)
+                Q, K, V,
+                attn_mask=attn_mask.unsqueeze(1) if attn_mask is not None else None,
+                dropout_p=self.dropout_rate if self.training else 0.0,
+                is_causal=False,  # 如果是自回归，设为 True
+                enable_gqa=True
             )
         else:
-            # 降级到标准注意力机制
-            scale = (self.head_dim) ** -0.5
+            # 降级实现（不推荐）
+            scale = self.head_dim ** -0.5
             scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
-
             if attn_mask is not None:
-                scores.masked_fill_(attn_mask.unsqueeze(
-                    1).logical_not(), float('-inf'))
-
+                scores.masked_fill_(attn_mask.logical_not().unsqueeze(1), float('-inf'))
             attn_weights = F.softmax(scores, dim=-1)
-            attn_weights = F.dropout(
-                attn_weights, p=self.dropout_rate, training=self.training)
+            attn_weights = F.dropout(attn_weights, p=self.dropout_rate, training=self.training)
             attn_output = torch.matmul(attn_weights, V)
 
-        # reshape回原来的格式
-        attn_output = attn_output.transpose(1, 2).contiguous().view(
-            batch_size, seq_len, self.hidden_units)
+        # 合并 heads
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
 
-        # 最终的线性变换
+        # 输出线性层
         output = self.out_linear(attn_output)
 
-        return output, None
+        # 是否返回注意力权重
+        attn_weights_out = attn_weights if need_weights else None
 
+        return output, attn_weights_out
 
 class PointWiseFeedForward(torch.nn.Module):
     def __init__(self, hidden_units, dropout_rate):
@@ -190,8 +263,8 @@ class BaselineModel(torch.nn.Module):
 
     def __init__(self, user_num, item_num, feat_statistics, feat_types, args):  #
         super(BaselineModel, self).__init__()
-        self.train_record = ["total_loss", "loss_explore", "loss_click", "pos_sim", "neg_sim", "pos_sim_click", "neg_sim_click"]
-        self.eval_record = ["total_loss", "loss_explore", "loss_click", "pos_sim", "neg_sim", "pos_sim_click", "neg_sim_click"]
+        self.train_record = ['total_loss', 'pos_sim', 'neg_sim']
+        self.eval_record = ['total_loss', 'pos_sim', 'neg_sim']
         self.user_num = user_num
         self.item_num = item_num
         self.dev = args.device
@@ -201,7 +274,7 @@ class BaselineModel(torch.nn.Module):
         self._init_feat_info(feat_statistics, feat_types)
         self.device = args.device
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
-        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch L1/L2 regularization in PyTorch L1/L2 regularization in PyTorch          
+        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch  L1/L2 regularization in PyTorch L1/L2 regularization in PyTorch          
         self.item_sparse_embedding_size = 0
         self.item_sparse_embedding_size += self.item_num + 1
         for k in self.ITEM_SPARSE_FEAT:
@@ -228,8 +301,8 @@ class BaselineModel(torch.nn.Module):
             self.user_array_embedding_size, args.hidden_units)
         self.item_array_emb = torch.nn.Embedding(
             self.item_array_embedding_size, args.hidden_units)
-        self.pos_emb = torch.nn.Embedding(
-            2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
+        # self.pos_emb = torch.nn.Embedding(
+        #     2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
 
         # self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         # self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
@@ -285,20 +358,7 @@ class BaselineModel(torch.nn.Module):
             new_fwd_layer = PointWiseFeedForward(
                 args.hidden_units, args.dropout_rate)
             self.forward_layers.append(new_fwd_layer)
-        self.ct_attention_layernorm = torch.nn.LayerNorm(
-                args.hidden_units, eps=1e-8)
-        self.ct_attention_layer = FlashMultiHeadAttention(
-                args.hidden_units, args.num_heads, args.dropout_rate
-            )
-        self.ct_forward_layers = PointWiseFeedForward(
-                args.hidden_units, args.dropout_rate)
-        self.cvr_attention_layernorm = torch.nn.LayerNorm(
-                args.hidden_units, eps=1e-8)
-        self.cvr_attention_layer = FlashMultiHeadAttention(
-                args.hidden_units, args.num_heads, args.dropout_rate
-            )
-        self.cvr_forward_layers = PointWiseFeedForward(
-                args.hidden_units, args.dropout_rate)
+
         self.bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
 
     def _init_feat_info(self, feat_statistics, feat_types):
@@ -386,7 +446,7 @@ class BaselineModel(torch.nn.Module):
         self.itemdnn.weight.data = torch.ones(self.itemdnn.weight.data.shape[0],self.itemdnn.weight.data.shape[1]).float().to(self.dev)
         self.userdnn.bias.data = torch.zeros(self.userdnn.bias.data.shape[0]).float().to(self.dev)
         self.itemdnn.bias.data = torch.zeros(self.itemdnn.bias.data.shape[0]).float().to(self.dev)
-        self.pos_emb.weight.data = torch.ones(self.pos_emb.weight.data.shape[0],self.pos_emb.weight.data.shape[1]).float().to(self.dev)
+        # self.pos_emb.weight.data = torch.ones(self.pos_emb.weight.data.shape[0],self.pos_emb.weight.data.shape[1]).float().to(self.dev)/
         
     def feat2tensor(self, seq_feature, k):
         """
@@ -503,15 +563,15 @@ class BaselineModel(torch.nn.Module):
         poss = torch.arange(
             1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
         poss *= mask != 0
-        seqs += self.pos_emb(poss)
+        # seqs += self.pos_emb(poss)
         seqs = self.emb_dropout(seqs)
         maxlen = seqs.shape[1]
         ones_matrix = torch.ones(
             (maxlen, maxlen), dtype=torch.bool, device=self.dev)
-        attention_mask_tril = torch.tril(ones_matrix)
-        attention_mask_pad = (mask != 0).to(self.dev)
+        attention_mask_tril = torch.tril(ones_matrix) # [seq_len, seq_len]
+        attention_mask_pad = (mask != 0).to(self.dev) # [batch_size, seq_len]
         attention_mask = attention_mask_tril.unsqueeze(
-            0) & attention_mask_pad.unsqueeze(1)
+            0) & attention_mask_pad.unsqueeze(1) # [batch_size, seq_len, seq_len]
 
         for i in range(len(self.attention_layers)):
             if self.norm_first:
@@ -528,22 +588,13 @@ class BaselineModel(torch.nn.Module):
                 seqs = self.attention_layernorms[i](seqs + mha_outputs)
                 seqs = self.forward_layernorms[i](
                     seqs + self.forward_layers[i](seqs))
-        # 分叉
-        seqs1 = self.ct_attention_layernorm(seqs)
-        seqs1,_ = self.ct_attention_layer(seqs1,seqs1,seqs1,attn_mask=attention_mask)
-        seqs1 = seqs + self.ct_forward_layers(seqs1)
-        seqs2 = self.cvr_attention_layernorm(seqs)
-        seqs2,_ = self.cvr_attention_layer(seqs2,seqs2,seqs2,attn_mask=attention_mask)
-        seqs2 = seqs + self.cvr_forward_layers(seqs2)
-        log_feats_1 = self.last_layernorm(seqs1)
-        log_feats_2 = self.last_layernorm(seqs) + log_feats_1
-        # 预测一个偏差
-        log_feats_1 = F.normalize(log_feats_1, dim=-1)
-        log_feats_2 = F.normalize(log_feats_2, dim=-1)
-        return log_feats_1 ,log_feats_2
+
+        log_feats = self.last_layernorm(seqs)
+        log_feats = F.normalize(log_feats, dim=-1)
+        return log_feats
 
     def forward(
-            self, mask, next_mask, next_action_type, seq_feature, pos_feature,pos_1_feat, neg_feature, user_feature
+            self, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature, user_feature
         ):
         """
         训练时调用，计算正负样本的logits
@@ -564,93 +615,36 @@ class BaselineModel(torch.nn.Module):
             neg_logits: 负样本logits，形状为 [batch_size, maxlen]
         """
 
-        log_feats_1,log_feats_2 = self.log2feats(seq_feature,user_feature,mask)
-        loss_mask = ((next_mask == 1) | (next_mask == 3)).to(self.dev)
+        log_feats = self.log2feats(seq_feature,user_feature,mask)
+        loss_mask = (next_mask == 1).to(self.dev)
         # 正样本，负样本拼接
         # seq_len = mask.shape[1]
         # input = {}
         # for key in pos_feature:
         #     input[key]=torch.cat([pos_feature[key],neg_feature[key]],dim=1)
         pos_embs = self.feat2emb(**pos_feature, include_user=False)
-        pos_embs_1 = self.feat2emb(**pos_1_feat, include_user=False)
         neg_embs = self.feat2emb(**neg_feature, include_user=False)
         # embds = self.feat2emb(**input, include_user=False)
         # pos_embs = embds[:, :seq_len, :]  # (B, L_pos, D)
         # neg_embs = embds[:, seq_len:, :]  # (B, L_neg, D)
-        loss_mask = (next_mask == 3).to(self.dev) 
 
-        loss_explore, pos_sim, neg_sim = self.loss(log_feats_1, pos_embs, neg_embs, loss_mask)
-        loss_click, pos_sim_lick, neg_sim_click = self.loss(log_feats_1, pos_embs_1, neg_embs, loss_mask)
-        total_loss = loss_explore + loss_click
+
+        loss, pos_sim, neg_sim = self.loss(log_feats, pos_embs, neg_embs, loss_mask)
+
         return {
-            "total_loss": total_loss,
-            "loss_explore": loss_explore,
-            "loss_click": loss_click,
+            "total_loss": loss,
             "pos_sim": pos_sim,
-            "neg_sim": neg_sim,
-            "pos_sim_click": pos_sim_lick,
-            "neg_sim_click": neg_sim_click,
+            "neg_sim": neg_sim
         }
 
     def loss(self, log_feats, pos_embs, neg_embs, loss_mask, temperature=0.07):
-        device = log_feats.device
         B, T, D = log_feats.shape
         N = neg_embs.shape[1] // T  # 每个位置的负样本数
-
-        # Reshape neg_embs: [B, N*T, D] -> [B, N, T, D]
-        neg_embs = neg_embs.view(B, T, N, D)  # 更高效 than unsqueeze + reshape
-
-        # 提取有效位置 mask
-        valid_mask = loss_mask.bool()  # [B, T]
-        if not valid_mask.any():
-            dummy = torch.tensor(0.0, device=device, requires_grad=True)
-            return dummy, 0.0, 0.0
-
-        # ================================
-        # Step 1: 提取 valid 的 query, pos, negs
-        # ================================
-        # 注意：neg_embs 需要按位置提取，不能直接索引
-        # 我们先计算所有位置的 logits，再 mask + gather
-        # 计算所有位置的正样本相似度: [B, T]
-        pos_logits = torch.einsum('btd,btd->bt', log_feats, pos_embs)  # [B, T]
-
-        # 计算负样本相似度: [B, T] x [B, N, T, D] -> [B, N, T]
-        # 使用 einsum: 'btd,bnTd->bnT'
-        neg_logits = torch.einsum('btd,btnd->btn', log_feats, neg_embs)  # [B, T, N]
-
-        # 转置 neg_logits -> [B, T, N] 便于后续 concat
-        # neg_logits = neg_logits.transpose(1, 2)  # [B, T, N]
-
-        # Apply mask to logits (zero out invalid positions)
-        # mask_float = loss_mask.unsqueeze(-1)  # [B, T, 1]
-        pos_logits = pos_logits * loss_mask  # [B, T]
-        neg_logits = neg_logits * loss_mask.unsqueeze(-1)  # [B, T, N]
-
-        # ================================
-        # Step 2: 只对 valid 位置 gather 并计算 loss
-        # ================================
-        # Flatten to [B*T, ...]
-        pos_logits_flat = pos_logits.view(-1)        # [B*T]
-        neg_logits_flat = neg_logits.view(-1, N)     # [B*T, N]
-
-        # 获取 valid indices
-        flat_mask = loss_mask.view(-1)               # [B*T]
-        pos_logits_valid = pos_logits_flat[flat_mask]     # [V]
-        neg_logits_valid = neg_logits_flat[flat_mask]     # [V, N]
-
-        # 构造 InfoNCE logits: [V, 1 + N]
-        logits = torch.cat([pos_logits_valid.unsqueeze(1), neg_logits_valid], dim=1)  # [V, 1+N]
-        logits /= temperature
-        labels = torch.zeros(logits.size(0), device=device, dtype=torch.long)  # 正样本位置 = 0
-
-        loss = F.cross_entropy(logits, labels)
-
-        # ================================
-        # 监控指标
-        # ================================
-        pos_sim = pos_logits_valid.mean().item()
-        neg_sim = neg_logits_valid.mean().item()
-
+        anchor_mask = torch.arange(B).unsqueeze(1).repeat(1,T).to(self.dev)[loss_mask]
+        anchor = log_feats[loss_mask]
+        positive = pos_embs[loss_mask]
+        negatives = neg_embs.reshape(B,T,N,D)[loss_mask]
+        loss, pos_sim, neg_sim = info_nce_loss(anchor,positive,anchor_mask,negatives,temperature=temperature)
         return loss, pos_sim, neg_sim
 
     def predict(self, seq_feature, user_feat, mask):
@@ -662,9 +656,9 @@ class BaselineModel(torch.nn.Module):
         Returns:
             final_feat: 用户序列的表征，形状为 [batch_size, hidden_units]
         """
-        log_feats_1,log_feats_2 = self.log2feats(seq_feature,user_feat,mask=mask)
+        log_feats = self.log2feats(seq_feature,user_feat,mask=mask)
 
-        final_feat = log_feats_2[:, -1, :]
+        final_feat = log_feats[:, -1, :]
 
         return final_feat
 

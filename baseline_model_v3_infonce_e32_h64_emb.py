@@ -12,79 +12,102 @@ from tqdm import tqdm
 from dataset import save_emb
 from utils import format_time
 
-
-def info_nce_loss(anchor, positive, anchor_mask=None, negatives=None,weight=None, temperature=0.07, use_inbatch_negatives=True):
+class ClassificationHead(nn.Module):
     """
-    InfoNCE Loss 支持：
-    - 显式负样本 (negatives)
-    - batch 内负样本 (可选)
+    一个通用的分类头，用于接在 item embedding 或表示层之后。
     
-    Args:
-        anchor: (N, D)
-        positive: (N, D)
-        negatives: (N, K, D) 或 None
-        temperature: float
-        use_inbatch_negatives: bool, 是否使用 batch 内其他样本作为负样本
-    
-    Returns:
-        loss: scalar
+    参数:
+        input_dim (int): 输入特征的维度，例如 self.attention_hidden_units
+        num_classes (int): 分类任务的类别总数
+        hidden_units (list): 各隐藏层的神经元数量，默认为 [input_dim]（即一层）
+        dropout_rate (float): Dropout 概率，默认 0.1
+        activation (str): 激活函数类型，支持 'relu', 'gelu', 'tanh'，默认 'relu'
+        use_layer_norm (bool): 是否在每个线性层后加 LayerNorm，默认 False
     """
-    device = anchor.device
-    batch_size = anchor.size(0)
+    def __init__(self, input_dim, num_classes, hidden_units=None, dropout_rate=0.1, activation='relu', use_layer_norm=False):
+        super(ClassificationHead, self).__init__()
+        
+        # 默认使用一个与输入维度相同的隐藏层
+        if hidden_units is None:
+            hidden_units = [input_dim]
+        
+        layers = []
+        in_features = input_dim
+        
+        for units in hidden_units:
+            layers.append(nn.Linear(in_features, units))
+            
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(units))
+            
+            if activation == 'relu':
+                layers.append(nn.ReLU())
+            elif activation == 'gelu':
+                layers.append(nn.GELU())
+            elif activation == 'tanh':
+                layers.append(nn.Tanh())
+            else:
+                raise ValueError(f"Unsupported activation: {activation}")
+            
+            layers.append(nn.Dropout(dropout_rate))
+            in_features = units
+        
+        # 输出层
+        layers.append(nn.Linear(in_features, num_classes))
+        
+        self.classifier = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        """
+        输入:
+            x: shape [batch_size, input_dim]
+        输出:
+            logits: shape [batch_size, num_classes]
+        """
+        return self.classifier(x)
 
-    # L2 归一化
+def info_nce_loss(arch_emb, pos_emb, temperature=0.1):
+    device = arch_emb.device
+    B, D = arch_emb.shape
 
-    # ========== 构建 logits ==========
-    # 正样本相似度: (N, 1)
-    pos_sim = torch.sum(anchor * positive, dim=1, keepdim=True)  # (N, 1)
+    # 归一化
+    arch_emb = F.normalize(arch_emb, dim=-1)
+    pos_emb = F.normalize(pos_emb, dim=-1)
 
-    # 显式负样本相似度: (N, K)
-    neg_sim_list = []
+    # 拼接 [2B, D]
+    z = torch.cat([arch_emb, pos_emb], dim=0)  # [2B, D]
 
-    if negatives is not None:
-        explicit_neg_sim = torch.bmm(anchor.unsqueeze(1), negatives.transpose(1, 2))  # (N, 1, K)
-        explicit_neg_sim = explicit_neg_sim.squeeze(1)  # (N, K)
-        neg_sim_list.append(explicit_neg_sim)
+    # 计算相似度矩阵 [2B, 2B]
+    sim = F.cosine_similarity(z.unsqueeze(1), z.unsqueeze(0), dim=-1)  # [2B, 2B]
+    sim /= temperature
 
-    # batch 内负样本: anchor 与所有 positive 的相似度，去掉对角线（自己）
-    if use_inbatch_negatives:
-        # 计算 anchor 与所有 positive 的相似度（包括自己）
-        inbatch_sim = torch.matmul(anchor, positive.T)  # (N, N)
-        # 除了本样本之外所有的其他样本作为负样本
-        # 创建 mask，去掉对角线（正样本）
-        # anchor_mask = [1,1,1,2,2,3,3,3]
-        # 变
-        # [T,T,T,F,F,F,F,F]
-        # [T,T,T,F,F,F,F,F]
-        # [T,T,T,F,F,F,F,F]
-        # [F,F,F,T,T,F,F,F]
-        mask = torch.eye(batch_size, dtype=torch.bool, device=device)
-        if anchor_mask is not None:
-            batch_mask = (anchor_mask.unsqueeze(0) == anchor_mask.unsqueeze(1)) 
-            mask = mask & batch_mask
-        inbatch_neg_sim = inbatch_sim.masked_select(~mask).view(batch_size, -1)  # (N, N-1)
-        neg_sim_list.append(inbatch_neg_sim)
+    # ========== 提取监控指标（复用 sim，无额外计算）==========
+    with torch.no_grad():
+        # 正样本相似度：arch_emb[i] vs pos_emb[i] → sim[i, i+B]
+        pos_sim = sim[range(B), range(B, 2*B)].mean()
 
-    # 拼接所有负样本相似度
-    if neg_sim_list:
-        neg_sim = torch.cat(neg_sim_list, dim=1)  # (N, K + N - 1)
-    else:
-        raise ValueError("At least one type of negative samples must be provided.")
+        # 负样本相似度：所有非正样本对
+        # 创建 mask：排除 (i, i+B) 和 (i+B, i)
+        neg_mask = torch.ones(2*B, 2*B, dtype=torch.bool, device=device)
+        neg_mask[range(B), range(B, 2*B)] = False  # arch[i] vs pos[i]
+        neg_mask[range(B, 2*B), range(B)] = False  # pos[i] vs arch[i]
+        # 可选：也可以排除自相似（i,i），但通常很小
+        # neg_mask[range(2*B), range(2*B)] = False
 
-    # 拼接正 + 负
-    logits = torch.cat([pos_sim, neg_sim], dim=1) / temperature  # (N, 1 + K + N - 1)
+        neg_sim = sim[neg_mask].mean()
+    # ====================================================
 
-    # 标签：正样本在第 0 位
-    labels = torch.zeros(batch_size, dtype=torch.long).to(device)
+    # ========== 计算损失 ==========
+    # logits: [B, 2B], 以 arch_emb 为 anchor
+    logits = sim[:B]  # [B, 2B]
 
-    loss = F.cross_entropy(logits, labels, reduction='none')
-    if weight is not None:
-        loss = loss*weight
-    return loss.mean(), pos_sim.mean(), neg_sim.mean()
+    # label: 正样本是 pos_emb[i]，索引为 i + B
+    labels = torch.arange(B, 2*B, device=device)  # [B]
 
+    loss = F.cross_entropy(logits, labels)
+    # ==============================
 
-
-
+    return loss, pos_sim, neg_sim
 class FlashMultiHeadAttention(torch.nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
         super(FlashMultiHeadAttention, self).__init__()
@@ -147,23 +170,102 @@ class FlashMultiHeadAttention(torch.nn.Module):
         return output, None
 
 
-class PointWiseFeedForward(torch.nn.Module):
+class PointWiseFeedForward(nn.Module):
     def __init__(self, hidden_units, dropout_rate):
         super(PointWiseFeedForward, self).__init__()
 
-        self.conv1 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
-        self.dropout1 = torch.nn.Dropout(p=dropout_rate)
-        self.relu = torch.nn.ReLU()
-        self.conv2 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
-        self.dropout2 = torch.nn.Dropout(p=dropout_rate)
+        # 方案一：标准 SwiGLU（推荐：扩展中间维度）
+        expansion_factor = 4  # 或 3.5, 2/3 等，常见为 4
+        self.w1 = nn.Linear(hidden_units, hidden_units * expansion_factor)  # 可学习参数 V
+        self.w2 = nn.Linear(hidden_units, hidden_units * expansion_factor)  # 可学习参数 W
+        self.w3 = nn.Linear(hidden_units * expansion_factor, hidden_units)  # 输出投影
+
+        self.dropout = nn.Dropout(p=dropout_rate)
+        self.activation = nn.SiLU()  # SiLU 是 Swish: x * sigmoid(x)
 
     def forward(self, inputs):
-        outputs = self.dropout2(self.conv2(
-            self.relu(self.dropout1(self.conv1(inputs.transpose(-1, -2))))))
-        # as Conv1D requires (N, C, Length)
-        outputs = outputs.transpose(-1, -2)
+        # inputs: [B, seq_len, hidden_units]
+        gate = self.w1(inputs)        # [B, seq_len, expansion * hidden]
+        x = self.w2(inputs)           # [B, seq_len, expansion * hidden]
+        fused = self.activation(gate) * x  # SwiGLU: swish(gate) * x
+        outputs = self.w3(fused)      # [B, seq_len, hidden_units]
+        outputs = self.dropout(outputs)
         return outputs
 
+class SwiGLU(nn.Module):
+    """SwiGLU 激活函数实现：(x * sigmoid(x)) * gate"""
+    def __init__(self, hidden_units, expansion_factor=4):
+        super(SwiGLU, self).__init__()
+        self.w1 = nn.Linear(hidden_units, hidden_units * expansion_factor)  # gate
+        self.w2 = nn.Linear(hidden_units, hidden_units * expansion_factor)  # value
+        self.w3 = nn.Linear(hidden_units * expansion_factor, hidden_units)  # output
+        self.activation = nn.SiLU()
+
+    def forward(self, x):
+        gate = self.w1(x)
+        value = self.w2(x)
+        fused = self.activation(gate) * value
+        return self.w3(fused)
+
+
+class FastMoE(nn.Module):
+    def __init__(self, hidden_units, num_experts=4, top_k=2, dropout_rate=0.1, expansion_factor=4):
+        super(FastMoE, self).__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+        # 创建多个专家（每个专家是一个 SwiGLU FFN）
+        self.experts = nn.ModuleList([
+            SwiGLU(hidden_units, expansion_factor) for _ in range(num_experts)
+        ])
+
+        # 门控网络：输出每个 token 对应的专家权重
+        self.gate = nn.Linear(hidden_units, num_experts)
+
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, inputs):
+        # inputs: [B, seq_len, hidden_units]
+        B, T, H = inputs.shape
+        x = inputs.view(-1, H)  # [B*T, H]
+
+        # 计算门控权重：[B*T, num_experts]
+        gate_logits = self.gate(x)  # [B*T, num_experts]
+        gate_probs = F.softmax(gate_logits, dim=-1)
+
+        # 取 top-k 专家
+        top_k_weights, top_k_indices = torch.topk(gate_probs, self.top_k, dim=-1)  # [B*T, top_k]
+        top_k_weights = F.softmax(top_k_weights, dim=-1)  # renormalize
+
+        # 初始化输出
+        output = torch.zeros_like(x)
+
+        # 对每个专家分别处理
+        for i in range(self.top_k):
+            expert_weights = top_k_weights[:, i]  # [B*T]
+            expert_idx = top_k_indices[:, i]      # [B*T]
+
+            # 对每个专家，收集其对应的 token
+            for e in range(self.num_experts):
+                # mask 表示当前专家 e 是否在 top-k 中
+                mask = (expert_idx == e)
+                if mask.sum() == 0:
+                    continue
+
+                # 获取该专家处理的 token
+                expert_inputs = x[mask]
+                expert_output = self.experts[e](expert_inputs)  # [num_masked, H]
+
+                # 加权并累加到输出
+                output[mask] += expert_output * expert_weights[mask].unsqueeze(-1)
+
+        # 残差连接（可选）+ Dropout
+        output = self.dropout(output)
+
+        # 恢复形状
+        output = output.view(B, T, H)
+        return output
+    
 
 class BaselineModel(torch.nn.Module):
     """
@@ -190,14 +292,13 @@ class BaselineModel(torch.nn.Module):
 
     def __init__(self, user_num, item_num, feat_statistics, feat_types, args):  #
         super(BaselineModel, self).__init__()
-        self.train_record = ["total_loss", "loss_explore", "loss_click", "pos_sim", "neg_sim", "pos_sim_click", "neg_sim_click"]
-        self.eval_record = ["total_loss", "loss_explore", "loss_click", "pos_sim", "neg_sim", "pos_sim_click", "neg_sim_click"]
         self.user_num = user_num
         self.item_num = item_num
         self.dev = args.device
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
-        self.hidden_units = args.hidden_units
+        self.embedding_hidden_units = 64
+        self.attention_hidden_units = 256
         self._init_feat_info(feat_statistics, feat_types)
         self.device = args.device
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
@@ -221,15 +322,13 @@ class BaselineModel(torch.nn.Module):
             self.user_array_embedding_size += self.USER_ARRAY_FEAT[k] + 1
 
         self.item_sparse_emb = torch.nn.Embedding(
-            self.item_sparse_embedding_size, args.hidden_units)
+            self.item_sparse_embedding_size, self.embedding_hidden_units)
         self.user_sparse_emb = torch.nn.Embedding(
-            self.user_sparse_embedding_size, args.hidden_units)
+            self.user_sparse_embedding_size, self.embedding_hidden_units)
         self.user_array_emb = torch.nn.Embedding(
-            self.user_array_embedding_size, args.hidden_units)
+            self.user_array_embedding_size, self.embedding_hidden_units)
         self.item_array_emb = torch.nn.Embedding(
-            self.item_array_embedding_size, args.hidden_units)
-        self.pos_emb = torch.nn.Embedding(
-            2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
+            self.item_array_embedding_size, self.embedding_hidden_units)
 
         # self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         # self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
@@ -245,7 +344,7 @@ class BaselineModel(torch.nn.Module):
         mm_input_len = 0
         for k in self.ITEM_EMB_FEAT:
             mm_input_len += self.ITEM_EMB_FEAT[k]
-        self.emb_transform = torch.nn.Linear(mm_input_len, args.hidden_units)
+        self.emb_transform = torch.nn.Linear(mm_input_len, self.embedding_hidden_units)
         self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
 
         self.attention_layernorms = torch.nn.ModuleList()  # to be Q for self-attention
@@ -254,52 +353,37 @@ class BaselineModel(torch.nn.Module):
         self.forward_layers = torch.nn.ModuleList()
 
 
-        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
-            self.USER_CONTINUAL_FEAT
-        )
         itemdim = (
-            args.hidden_units * (len(self.ITEM_SPARSE_FEAT) +
+            self.embedding_hidden_units * (len(self.ITEM_SPARSE_FEAT) +
                                  1 + len(self.ITEM_ARRAY_FEAT))
             + len(self.ITEM_CONTINUAL_FEAT)
-            + args.hidden_units * len(self.ITEM_EMB_FEAT)
+            + self.embedding_hidden_units * len(self.ITEM_EMB_FEAT)
         )
 
-        self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
-        self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
-
-        self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-
-        for _ in range(args.num_blocks):
-            new_attn_layernorm = torch.nn.LayerNorm(
-                args.hidden_units, eps=1e-8)
-            self.attention_layernorms.append(new_attn_layernorm)
-
-            new_attn_layer = FlashMultiHeadAttention(
-                args.hidden_units, args.num_heads, args.dropout_rate
-            )  # 优化：用FlashAttention替代标准Attention
-            self.attention_layers.append(new_attn_layer)
-
-            new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-            self.forward_layernorms.append(new_fwd_layernorm)
-
-            new_fwd_layer = PointWiseFeedForward(
-                args.hidden_units, args.dropout_rate)
-            self.forward_layers.append(new_fwd_layer)
-        self.ct_attention_layernorm = torch.nn.LayerNorm(
-                args.hidden_units, eps=1e-8)
-        self.ct_attention_layer = FlashMultiHeadAttention(
-                args.hidden_units, args.num_heads, args.dropout_rate
-            )
-        self.ct_forward_layers = PointWiseFeedForward(
-                args.hidden_units, args.dropout_rate)
-        self.cvr_attention_layernorm = torch.nn.LayerNorm(
-                args.hidden_units, eps=1e-8)
-        self.cvr_attention_layer = FlashMultiHeadAttention(
-                args.hidden_units, args.num_heads, args.dropout_rate
-            )
-        self.cvr_forward_layers = PointWiseFeedForward(
-                args.hidden_units, args.dropout_rate)
-        self.bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
+        self.itemdnn = torch.nn.Linear(itemdim, self.attention_hidden_units)
+        # 训练一些特殊的值
+        self.predict_feature_list = [
+            '100',
+            '117',
+            '111',
+            '118',
+            '101',
+            '102',
+            '119',
+            '120',
+            '114',
+            '112',
+            '121',
+            '115',
+            '122',
+            '116',
+        ]
+        self.classifiers = nn.ModuleDict()
+        for key in self.predict_feature_list:
+            self.classifiers[key] = ClassificationHead(self.attention_hidden_units,feat_statistics[key]+1)
+        
+        self.train_record = ['total_loss', 'infonce_loss', 'pos_sim', 'neg_sim'] +[f'cls_{i}' for i in self.predict_feature_list]
+        self.eval_record = self.train_record
 
     def _init_feat_info(self, feat_statistics, feat_types):
         """
@@ -388,48 +472,7 @@ class BaselineModel(torch.nn.Module):
         self.itemdnn.bias.data = torch.zeros(self.itemdnn.bias.data.shape[0]).float().to(self.dev)
         self.pos_emb.weight.data = torch.ones(self.pos_emb.weight.data.shape[0],self.pos_emb.weight.data.shape[1]).float().to(self.dev)
         
-    def feat2tensor(self, seq_feature, k):
-        """
-        Args:
-            seq_feature: 序列特征list，每个元素为当前时刻的特征字典，形状为 [batch_size, maxlen]
-            k: 特征ID
-
-        Returns:
-            batch_data: 特征值的tensor，形状为 [batch_size, maxlen, max_array_len(if array)]
-        """
-        batch_size = len(seq_feature)
-
-        if k in self.ITEM_ARRAY_FEAT or k in self.USER_ARRAY_FEAT:
-            # 如果特征是Array类型，需要先对array进行padding，然后转换为tensor
-            max_array_len = 0
-            max_seq_len = 0
-
-            for i in range(batch_size):
-                seq_data = [item[k] for item in seq_feature[i]]
-                max_seq_len = max(max_seq_len, len(seq_data))
-                max_array_len = max(max_array_len, max(
-                    len(item_data) for item_data in seq_data))
-
-            batch_data = np.zeros(
-                (batch_size, max_seq_len, max_array_len), dtype=np.int64)
-            for i in range(batch_size):
-                seq_data = [item[k] for item in seq_feature[i]]
-                for j, item_data in enumerate(seq_data):
-                    actual_len = min(len(item_data), max_array_len)
-                    batch_data[i, j, :actual_len] = item_data[:actual_len]
-
-            return torch.from_numpy(batch_data).to(self.dev)
-        else:
-            # 如果特征是Sparse类型，直接转换为tensor
-            max_seq_len = max(len(seq_feature[i]) for i in range(batch_size))
-            batch_data = np.zeros((batch_size, max_seq_len), dtype=np.int64)
-
-            for i in range(batch_size):
-                seq_data = [item[k] for item in seq_feature[i]]
-                batch_data[i] = seq_data
-
-            return torch.from_numpy(batch_data).to(self.dev)
-
+    
     def feat2emb(self,
             user_sparse_feature=None,
             user_continual_feature=None,
@@ -458,11 +501,11 @@ class BaselineModel(torch.nn.Module):
         #     for start in range(0,item_array_embs.shape[-2],10)
         # ], dim=-1) # 最后一维拼接 [batch_size, seq_len, sparse_num*hidden_units]
         
-        item_sparse_embs = self.item_sparse_emb(item_sparse_feature).reshape(item_sparse_feature.shape[0], item_sparse_feature.shape[1], -1) # [batch_size, seq_len, sparse_num*hidden_units]
+        item_sparse_embs = self.item_sparse_emb(item_sparse_feature).reshape(item_sparse_feature.shape[0], -1) # [batch_size, sparse_num*hidden_units]
         # 拼接过dnn输出
         item_mm_embs = self.emb_transform(item_mm_embs)
         all_item_emb = torch.cat([item_sparse_embs, item_continual_feature, item_mm_embs], dim=-1)
-        all_embedding = torch.relu(self.itemdnn(all_item_emb))
+        all_embedding = torch.nn.functional.leaky_relu(self.itemdnn(all_item_emb))
 
         if include_user:
             user_array_embs = self.user_array_emb(user_array_feature) # [batch_size,]
@@ -471,7 +514,7 @@ class BaselineModel(torch.nn.Module):
             user_array_embs = torch.cat(user_array_embs, dim=-1)
             user_sparse_embs = self.user_sparse_emb(user_sparse_feature).reshape(user_sparse_feature.shape[0],-1) #[batch_size, seq_len, num_sparse_feat *hidden_units]
             all_user_embs = torch.cat([user_sparse_embs, user_array_embs, user_continual_feature], dim=-1)
-            all_user_embs = torch.relu(self.userdnn(all_user_embs))
+            all_user_embs = torch.nn.functional.leaky_relu(self.userdnn(all_user_embs))
             # insert all_user_emb to all_embedding
             user_mask_expanded = (mask == 2).unsqueeze(-1).repeat(1,1,all_embedding.shape[-1])
 
@@ -481,192 +524,72 @@ class BaselineModel(torch.nn.Module):
         all_embedding = F.normalize(all_embedding, dim=-1)
         return all_embedding
 
-    def log2feats(self, seq_feature, user_feature, mask):
-        """
-        Args:
-            log_seqs: 序列ID
-            mask: token类型掩码，1表示item token，2表示user token
-            seq_feature: 序列特征list，每个元素为当前时刻的特征字典
-
-        Returns:
-            seqs_emb: 序列的Embedding，形状为 [batch_size, maxlen, hidden_units]
-        """
-        batch_size = mask.shape[0]
-        maxlen = mask.shape[1]
-        seqs = self.feat2emb(**seq_feature,
-                             **user_feature,
-                             mask=mask, include_user=True)
-
-
-
-        seqs *= self.hidden_units**0.5
-        poss = torch.arange(
-            1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
-        poss *= mask != 0
-        seqs += self.pos_emb(poss)
-        seqs = self.emb_dropout(seqs)
-        maxlen = seqs.shape[1]
-        ones_matrix = torch.ones(
-            (maxlen, maxlen), dtype=torch.bool, device=self.dev)
-        attention_mask_tril = torch.tril(ones_matrix)
-        attention_mask_pad = (mask != 0).to(self.dev)
-        attention_mask = attention_mask_tril.unsqueeze(
-            0) & attention_mask_pad.unsqueeze(1)
-
-        for i in range(len(self.attention_layers)):
-            if self.norm_first:
-                x = seqs
-                x = self.attention_layernorms[i](x)
-                mha_outputs, _ = self.attention_layers[i](
-                    x, x, x, attn_mask=attention_mask)
-                seqs = seqs + mha_outputs
-                seqs = seqs + \
-                    self.forward_layers[i](self.forward_layernorms[i](seqs))
-            else:
-                mha_outputs, _ = self.attention_layers[i](
-                    seqs, seqs, seqs, attn_mask=attention_mask)
-                seqs = self.attention_layernorms[i](seqs + mha_outputs)
-                seqs = self.forward_layernorms[i](
-                    seqs + self.forward_layers[i](seqs))
-        # 分叉
-        seqs1 = self.ct_attention_layernorm(seqs)
-        seqs1,_ = self.ct_attention_layer(seqs1,seqs1,seqs1,attn_mask=attention_mask)
-        seqs1 = seqs + self.ct_forward_layers(seqs1)
-        seqs2 = self.cvr_attention_layernorm(seqs)
-        seqs2,_ = self.cvr_attention_layer(seqs2,seqs2,seqs2,attn_mask=attention_mask)
-        seqs2 = seqs + self.cvr_forward_layers(seqs2)
-        log_feats_1 = self.last_layernorm(seqs1)
-        log_feats_2 = self.last_layernorm(seqs) + log_feats_1
-        # 预测一个偏差
-        log_feats_1 = F.normalize(log_feats_1, dim=-1)
-        log_feats_2 = F.normalize(log_feats_2, dim=-1)
-        return log_feats_1 ,log_feats_2
-
+   
     def forward(
-            self, mask, next_mask, next_action_type, seq_feature, pos_feature,pos_1_feat, neg_feature, user_feature
+            self, pos1, pos2,pos1_labels, pos2_labels
         ):
         """
         训练时调用，计算正负样本的logits
 
         Args:
-            user_item: 用户序列ID
-            pos_seqs: 正样本序列ID
-            neg_seqs: 负样本序列ID
-            mask: token类型掩码，1表示item token，2表示user token
-            next_mask: 下一个token类型掩码，1表示item token，2表示user token
-            next_action_type: 下一个token动作类型，0表示曝光，1表示点击
-            seq_feature: 序列特征list，每个元素为当前时刻的特征字典
-            pos_feature: 正样本特征list，每个元素为当前时刻的特征字典
-            neg_feature: 负样本特征list，每个元素为当前时刻的特征字典
-
         Returns:
-            pos_logits: 正样本logits，形状为 [batch_size, maxlen]
-            neg_logits: 负样本logits，形状为 [batch_size, maxlen]
+
         """
 
-        log_feats_1,log_feats_2 = self.log2feats(seq_feature,user_feature,mask)
-        loss_mask = ((next_mask == 1) | (next_mask == 3)).to(self.dev)
-        # 正样本，负样本拼接
-        # seq_len = mask.shape[1]
-        # input = {}
-        # for key in pos_feature:
-        #     input[key]=torch.cat([pos_feature[key],neg_feature[key]],dim=1)
-        pos_embs = self.feat2emb(**pos_feature, include_user=False)
-        pos_embs_1 = self.feat2emb(**pos_1_feat, include_user=False)
-        neg_embs = self.feat2emb(**neg_feature, include_user=False)
-        # embds = self.feat2emb(**input, include_user=False)
-        # pos_embs = embds[:, :seq_len, :]  # (B, L_pos, D)
-        # neg_embs = embds[:, seq_len:, :]  # (B, L_neg, D)
-        loss_mask = (next_mask == 3).to(self.dev) 
+        # 只构建对比学习样本
+        pos1_emb = self.feat2emb(**pos1)
+        pos2_emb = self.feat2emb(**pos2)
+        infonce_loss, pos_sim, neg_sim = info_nce_loss(pos1_emb, pos2_emb)
+        classify_loss = {}
+        # 分类损失计算，用pos1_emb,pos2_emb 作为输入
+        for i, feat_key in enumerate(self.predict_feature_list):
+            classifier = self.classifiers[feat_key]  # ✅ 静态访问，支持编译
 
-        loss_explore, pos_sim, neg_sim = self.loss(log_feats_1, pos_embs, neg_embs, loss_mask)
-        loss_click, pos_sim_lick, neg_sim_click = self.loss(log_feats_1, pos_embs_1, neg_embs, loss_mask)
-        total_loss = loss_explore + loss_click
+            label_1 = pos1_labels[:, i]  # [B]
+            label_2 = pos2_labels[:, i]  # [B]
+
+            # 计算 logits
+            logits_1 = classifier(pos1_emb)
+            logits_2 = classifier(pos2_emb)
+
+            # 计算损失，忽略 -1
+            loss_1 = nn.functional.cross_entropy(logits_1, label_1, ignore_index=0, reduction='mean')
+            loss_2 = nn.functional.cross_entropy(logits_2, label_2, ignore_index=0, reduction='mean')
+
+            total_cls_loss = (loss_1 + loss_2) / 2.0
+            classify_loss[f'cls_{feat_key}'] = total_cls_loss
+                # Step 5: 混合损失
+        lambda_co = 1.0
+        lambda_cls = 0.01
+        cls_weights = {
+            'cls_100': 5.0,
+            'cls_117': 1.0,
+            'cls_111': 0.3,
+            'cls_118': 0.7,
+            'cls_101': 1.7,
+            'cls_102': 0.3,
+            'cls_119': 0.5,
+            'cls_120': 1.0,
+            'cls_114': 2.2,
+            'cls_112': 2.9,
+            'cls_121': 0.3,
+            'cls_115': 4.3,
+            'cls_122': 0.3,
+            'cls_116': 2.2,
+        }
+        total_loss = lambda_co * infonce_loss
+        for loss in classify_loss.values():
+            total_loss += lambda_cls * loss
+        # for key in classify_loss:
+        #     total_loss +=classify_loss[key]*cls_weights[key]
         return {
             "total_loss": total_loss,
-            "loss_explore": loss_explore,
-            "loss_click": loss_click,
+            "infonce_loss":infonce_loss,
             "pos_sim": pos_sim,
             "neg_sim": neg_sim,
-            "pos_sim_click": pos_sim_lick,
-            "neg_sim_click": neg_sim_click,
+            **classify_loss
         }
 
-    def loss(self, log_feats, pos_embs, neg_embs, loss_mask, temperature=0.07):
-        device = log_feats.device
-        B, T, D = log_feats.shape
-        N = neg_embs.shape[1] // T  # 每个位置的负样本数
-
-        # Reshape neg_embs: [B, N*T, D] -> [B, N, T, D]
-        neg_embs = neg_embs.view(B, T, N, D)  # 更高效 than unsqueeze + reshape
-
-        # 提取有效位置 mask
-        valid_mask = loss_mask.bool()  # [B, T]
-        if not valid_mask.any():
-            dummy = torch.tensor(0.0, device=device, requires_grad=True)
-            return dummy, 0.0, 0.0
-
-        # ================================
-        # Step 1: 提取 valid 的 query, pos, negs
-        # ================================
-        # 注意：neg_embs 需要按位置提取，不能直接索引
-        # 我们先计算所有位置的 logits，再 mask + gather
-        # 计算所有位置的正样本相似度: [B, T]
-        pos_logits = torch.einsum('btd,btd->bt', log_feats, pos_embs)  # [B, T]
-
-        # 计算负样本相似度: [B, T] x [B, N, T, D] -> [B, N, T]
-        # 使用 einsum: 'btd,bnTd->bnT'
-        neg_logits = torch.einsum('btd,btnd->btn', log_feats, neg_embs)  # [B, T, N]
-
-        # 转置 neg_logits -> [B, T, N] 便于后续 concat
-        # neg_logits = neg_logits.transpose(1, 2)  # [B, T, N]
-
-        # Apply mask to logits (zero out invalid positions)
-        # mask_float = loss_mask.unsqueeze(-1)  # [B, T, 1]
-        pos_logits = pos_logits * loss_mask  # [B, T]
-        neg_logits = neg_logits * loss_mask.unsqueeze(-1)  # [B, T, N]
-
-        # ================================
-        # Step 2: 只对 valid 位置 gather 并计算 loss
-        # ================================
-        # Flatten to [B*T, ...]
-        pos_logits_flat = pos_logits.view(-1)        # [B*T]
-        neg_logits_flat = neg_logits.view(-1, N)     # [B*T, N]
-
-        # 获取 valid indices
-        flat_mask = loss_mask.view(-1)               # [B*T]
-        pos_logits_valid = pos_logits_flat[flat_mask]     # [V]
-        neg_logits_valid = neg_logits_flat[flat_mask]     # [V, N]
-
-        # 构造 InfoNCE logits: [V, 1 + N]
-        logits = torch.cat([pos_logits_valid.unsqueeze(1), neg_logits_valid], dim=1)  # [V, 1+N]
-        logits /= temperature
-        labels = torch.zeros(logits.size(0), device=device, dtype=torch.long)  # 正样本位置 = 0
-
-        loss = F.cross_entropy(logits, labels)
-
-        # ================================
-        # 监控指标
-        # ================================
-        pos_sim = pos_logits_valid.mean().item()
-        neg_sim = neg_logits_valid.mean().item()
-
-        return loss, pos_sim, neg_sim
-
-    def predict(self, seq_feature, user_feat, mask):
-        """
-        计算用户序列的表征
-        Args:
-            seq_feature: 序列特征list，每个元素为当前时刻的特征字典
-            mask: token类型掩码，1表示item token，2表示user token
-        Returns:
-            final_feat: 用户序列的表征，形状为 [batch_size, hidden_units]
-        """
-        log_feats_1,log_feats_2 = self.log2feats(seq_feature,user_feat,mask=mask)
-
-        final_feat = log_feats_2[:, -1, :]
-
-        return final_feat
 
     def save_item_emb(self, item_ids, retrieval_ids, feat_dict, save_path, batch_size=1024):
         """

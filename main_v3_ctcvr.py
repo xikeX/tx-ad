@@ -23,7 +23,7 @@ from infer_class_v1 import Infer
 from my_dataset_preprocess import MMPBaseDataset as BaseDataset
 # from my_dataset_v1 import TrainDataset, ValidDataset
 from my_dataset_v1_aug_ctcvr import TrainDataset, ValidDataset
-from utils import set_environment, format_time
+from utils import set_environment, format_time, analyze_top_level_layers
 
 set_environment()
 
@@ -376,6 +376,7 @@ def main():
             print(f"⚠️ 权重加载失败: {e}")
 
     # 模型训练
+    analyze_top_level_layers(downstream_model)
     train_downstream_model(downstream_model, train_dataset, valid_dataset, args, writer, valid_dataset_valid, train_dataset_valid)
 
     # 加载最佳模型权重

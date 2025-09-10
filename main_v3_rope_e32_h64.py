@@ -15,16 +15,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import get_cosine_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup,get_linear_schedule_with_warmup
 
 # 本地自定义模块
-from baseline_model_v3_infonce import BaselineModel as DownstreamModel
+from baseline_model_v3_infonce_e32_h64 import BaselineModel as DownstreamModel
 from infer_class_v1 import Infer
 # from my_dataset_preprocess import MMPBaseDataset as BaseDataset
 from my_dataset_v1_aug import BaseDataset
-# from my_dataset_v1 import TrainDataset, ValidDataset
 from my_dataset_v1_aug import TrainDataset, ValidDataset
-from utils import set_environment, format_time
+from utils import analyze_top_level_layers, set_environment, format_time
 
 set_environment()
 
@@ -33,21 +32,21 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     # ================== 数据相关参数 ==================
-    parser.add_argument('--train_data_size', type=int, default=None, help='训练数据大小（-1 表示全量）')
-    parser.add_argument('--batch_size', type=int, default=128, help='训练/验证批大小')
+    parser.add_argument('--train_data_size', type=int, default=-1, help='训练数据大小（-1 表示全量）')
+    parser.add_argument('--batch_size', type=int, default=32, help='训练/验证批大小')
     parser.add_argument('--maxlen', type=int, default=101, help='序列最大长度')
     parser.add_argument('--num_worker', type=int, default=0, help='序列最大长度')
     parser.add_argument('--train_name', type=str, default="v3_baseline", help='训练名称')
 
     # ================== 模型结构参数 ==================
-    parser.add_argument('--hidden_units', type=int, default=32, help='隐藏层维度')
-    parser.add_argument('--num_blocks', type=int, default=1, help='Transformer 块数')
-    parser.add_argument('--num_heads', type=int, default=1, help='多头注意力头数')
-    parser.add_argument('--dropout_rate', type=float, default=0.2, help='Dropout 比例')
+    parser.add_argument('--hidden_units', type=int, default=128, help='隐藏层维度')
+    parser.add_argument('--num_blocks', type=int, default=8, help='Transformer 块数')
+    parser.add_argument('--num_heads', type=int, default=4, help='多头注意力头数')
+    parser.add_argument('--dropout_rate', type=float, default=0.1, help='Dropout 比例')
     parser.add_argument('--l2_emb', type=float, default=0.0, help='嵌入层 L2 正则强度')
     parser.add_argument('--norm_first', action='store_true', help='是否在 Transformer 中先归一化（Pre-LN）')
     parser.add_argument('--mm_emb_id', nargs='+', type=str, default=['81'], choices=[str(s) for s in range(81, 87)], help='多模态嵌入特征 ID 列表')
-
+    
     # ================== 训练优化参数 ==================
     parser.add_argument('--num_epochs', type=int, default=5, help='训练总轮数')
     parser.add_argument('--lr', type=float, default=1e-3, help='下游任务学习率')
@@ -60,7 +59,7 @@ def get_args():
     parser.add_argument('--state_dict_path', type=str, default=None, help='预训练权重路径')
     # 解析参数
     args = parser.parse_args()
-
+    args.norm_first=True
     # 自动设置 device
     if args.device == '':
         args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -68,25 +67,33 @@ def get_args():
     return args
 
 
+import torch.nn as nn
+
 def initialize_model_weights(model: nn.Module):
-    """递归初始化模型权重"""
+    """递归初始化模型权重，使用 Kaiming 初始化（适用于 ReLU/GELU 激活函数）"""
 
     def init_weights(m):
         if isinstance(m, nn.Linear):
-            nn.init.xavier_normal_(m.weight.data)
+            # Kaiming 正态分布初始化，适用于 ReLU/GELU
+            nn.init.kaiming_normal_(m.weight.data, mode='fan_in', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.zeros_(m.bias.data)
         elif isinstance(m, nn.Embedding):
-            # 使用小正态分布初始化嵌入层
+            # Embedding 层通常仍用小正态分布
             nn.init.normal_(m.weight.data, mean=0.0, std=0.02)
         elif isinstance(m, nn.Conv1d):
-            # 对 Conv1d (等价于 Linear) 使用 Xavier/Glorot 初始化
-            nn.init.xavier_normal_(m.weight)
+            # Conv1d 同样使用 Kaiming 初始化
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         else:
-            if hasattr(m, 'weight.data'):
-                nn.init.xavier_normal_(m.weight.data)
+            # 对其他层，如果有 weight 且未特别处理，尝试 Kaiming
+            if hasattr(m, 'weight') and isinstance(m.weight, nn.Parameter):
+                if m.weight.ndimension() >= 2:
+                    nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                # bias 一般置零
+                if hasattr(m, 'bias') and isinstance(m.bias, nn.Parameter):
+                    nn.init.zeros_(m.bias)
 
     model.apply(init_weights)
 
@@ -169,6 +176,10 @@ def train_model(args, model, train_loader, scaler, optimizer, scheduler, writer,
             optimizer.zero_grad()
             scaler.scale(total_loss).backward()
             # 更新参数
+            # 输出所有层的梯度到writer
+            # for name, param in model.named_parameters():
+            #     if param.requires_grad and param.grad is not None:
+            #         writer.add_scalar(name + '_grad', param.grad.norm(), global_step)
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -193,16 +204,16 @@ def train_downstream_model(model, train_dataset, valid_dataset, args, writer, te
     print("开始下游任务训练...")
 
     # ✅ 添加：学习率调度器（可选：ReduceLROnPlateau）
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=getattr(args, 'weight_decay', 0.0))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=getattr(args, 'weight_decay', 0.0))
     total_steps = args.num_epochs * len(train_dataset)//args.batch_size
-    scheduler = get_cosine_schedule_with_warmup(
+    scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=total_steps * 0.01,  # 例如：1000 步 warm-up
+        num_warmup_steps=total_steps * 0.10,  # 例如：1000 步 warm-up
         num_training_steps=total_steps  # 总训练步数
     )
-    if os.environ.get('DEBUG_MODE', "") == "":
-        model = torch.compile(model)
-    scaler = torch.amp.GradScaler("cuda") if os.environ.get("DEBUG_MODE", "") == "True" else None
+    # if os.environ.get('DEBUG_MODE', "") == "":
+    #     model = torch.compile(model)
+    scaler = torch.amp.GradScaler("cuda")
 
     best_hitrate = -float('inf')  # ✅ 记录最佳验证损失
     global_step = 0
@@ -298,14 +309,14 @@ def pre_define():
 
 def create_train_dataset(args):
     base_dataset = BaseDataset(os.environ['TRAIN_DATA_PATH'], args)
-    train_idx, valid_idx = base_dataset.split_index([0.9, 0.1], args.train_data_size)
     if args.train_data_size == -1:
         args.train_data_size = None
-    if args.reflesh_cache or not os.path.exists(os.environ.get("USER_CACHE_PATH") + "/train_idx.pkl"):
-        with open(os.environ.get("USER_CACHE_PATH") + "/train_idx.pkl", "wb") as f:
+    train_idx, valid_idx = base_dataset.split_index([0.9, 0.1], args.train_data_size)
+    if args.reflesh_cache or not os.path.exists(os.environ.get("USER_CACHE_PATH") + "/train_idx_small.pkl"):
+        with open(os.environ.get("USER_CACHE_PATH") + "/train_idx_small.pkl", "wb") as f:
             pickle.dump(train_idx, f)
-    if args.reflesh_cache or not os.path.exists(os.environ.get("USER_CACHE_PATH") + "/valid_idx.pkl"):
-        with open(os.environ.get("USER_CACHE_PATH") + "/valid_idx.pkl", "wb") as f:
+    if args.reflesh_cache or not os.path.exists(os.environ.get("USER_CACHE_PATH") + "/valid_idx_small.pkl"):
+        with open(os.environ.get("USER_CACHE_PATH") + "/valid_idx_small.pkl", "wb") as f:
             pickle.dump(valid_idx, f)
     train_dataset = TrainDataset(base_dataset, sample_index=train_idx)  # 全量训练
     valid_dataset = TrainDataset(base_dataset, sample_index=valid_idx)
@@ -331,6 +342,7 @@ def create_valid_labels(args, train_dataset_valid, valid_dataset_valid):
         for item in train_dataset_valid:
             eval_candidate_index.append(item[-1])
             cnt += 1
+        train_dataset_valid = None
         res_eval_condidate_data = {}
         for item in eval_candidate_index:
             res_eval_condidate_data[str(item)] = condidate_data[str(item)]
@@ -347,6 +359,7 @@ def create_valid_labels(args, train_dataset_valid, valid_dataset_valid):
         for item in valid_dataset_valid:
             eval_candidate_index.append(item[-1])
             cnt += 1
+        valid_dataset_valid.data_file = None
         res_eval_condidate_data = {}
         for item in eval_candidate_index:
             res_eval_condidate_data[str(item)] = condidate_data[str(item)]
@@ -356,6 +369,42 @@ def create_valid_labels(args, train_dataset_valid, valid_dataset_valid):
         eval_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_eval.json')
     print("获取测试集候选数据完成")
     return eval_candidate_path, train_candidate_path
+
+def load_selected_weights(model, state_dict_path, selected_keys, device):
+    """
+    只加载指定 keys 的权重
+    :param model: 当前模型
+    :param state_dict_path: 预训练权重文件路径
+    :param selected_keys: 要加载的模块名列表，如 ['item_sparse_emb', 'user_sparse_emb']
+    :param device: 设备
+    """
+    # 加载预训练权重
+    pretrained_dict = torch.load(state_dict_path, map_location=device)
+    model_dict = model.state_dict()
+
+    # 构建要加载的 key 列表（只保留 selected_keys 开头的参数）
+    filtered_dict = {
+        k: v for k, v in pretrained_dict.items()
+        if any(k.startswith(prefix + '.') or k == prefix for prefix in selected_keys)
+    }
+    # 进行特殊处理
+    key_list = list(filtered_dict.keys())
+    for key in key_list:
+        filtered_dict[f"predict_{key}"]=filtered_dict[key]
+    # 更新当前模型的权重
+    # model_dict.update(filtered_dict)
+    model.load_state_dict(model_dict)
+
+    # 打印结果
+    print(f"✅ 已加载以下模块的权重:")
+    for k in filtered_dict:
+        print(f"    {k}")
+    print(f"✅ 共加载 {len(filtered_dict)} 个参数张量")
+
+# -------------------------------
+#       使用示例
+# -------------------------------
+
 
 
 def main():
@@ -369,35 +418,74 @@ def main():
     #模型加载
     downstream_model = DownstreamModel(base_dataset.usernum, base_dataset.itemnum, base_dataset.feat_statistics, base_dataset.feature_types, args).to(args.device)
     initialize_model_weights(downstream_model)
+    # 加载模型
+    # pth问啊见
+    args.state_dict_path = os.environ['USER_CACHE_PATH']+"/v3-embed/model.pt"
     if args.state_dict_path:
-        try:
-            downstream_model.load_state_dict(torch.load(args.state_dict_path, map_location=args.device))
-            print(f"✅ 已加载预训练权重: {args.state_dict_path}")
-        except Exception as e:
-            print(f"⚠️ 权重加载失败: {e}")
+        # try:
+            # downstream_model.load_state_dict(torch.load(args.state_dict_path, map_location=args.device))
+            # 创建下游模型
 
+            # 指定你想加载的模块名（注意：是属性名，不是类名）
+            selected_modules = [
+                'emb_transform',
+                'emb_dropout',        # Dropout 没有权重，但如果有其他参数会加载
+                'item_sparse_emb',
+                'user_sparse_emb',
+                'user_array_emb',
+                'item_array_emb'
+            ]
+
+            # 执行部分加载
+            load_selected_weights(downstream_model, args.state_dict_path, selected_modules, args.device)
+
+            print("✅ 部分权重加载完成！")
+
+        # except Exception as e:
+        #     print(f"⚠️ 权重加载失败: {e}")
+    # 冻结模型的嵌入层
+        #     self.item_sparse_emb = torch.nn.Embedding(
+        #     self.item_sparse_embedding_size, self.embedding_hidden_units)
+        # self.user_sparse_emb = torch.nn.Embedding(
+        #     self.user_sparse_embedding_size, self.embedding_hidden_units)
+        # self.user_array_emb = torch.nn.Embedding(
+        #     self.user_array_embedding_size, self.embedding_hidden_units)
+        # self.item_array_emb = torch.nn.Embedding(
+        #     self.item_array_embedding_size, self.embedding_hidden_units)
+    # downstream_model.item_sparse_emb.requires_grad_(False)
+    # downstream_model.item_array_emb.requires_grad_(False)
+    # downstream_model.itemdnn.requires_grad_(False)
     # 模型训练
+    analyze_top_level_layers(downstream_model)
     train_downstream_model(downstream_model, train_dataset, valid_dataset, args, writer, valid_dataset_valid, train_dataset_valid)
 
     # 加载最佳模型权重
-    try:
-        path = Path(os.environ.get('USER_CACHE_PATH')) / args.train_name
-        path = path / "model.pt"
-        downstream_model.load_state_dict(torch.load(path))
-        print(f"✅ 加载最佳模型权重: {path}")
-    except Exception as e:
-        print(f"⚠️ 权重加载失败: {e}")
+    # try:
+    #     path = Path(os.environ.get('USER_CACHE_PATH')) / args.train_name
+    #     path = path / "model.pt"
+    #     downstream_model.load_state_dict(torch.load(path))
+    #     print(f"✅ 加载最佳模型权重: {path}")
+    # except Exception as e:
+    #     print(f"⚠️ 权重加载失败: {e}")
 
     # 模型评估
     # print("✅ 推理开始")
-    # eval_candidate_path = os.path.join(os.environ['TRAIN_DATA_PATH'], 'item_feat_dict.json')
+    # eval_candidate_path = os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_eval.json')
     # infer = Infer(args, downstream_model, eval_dataset=valid_dataset_valid, candidate_path=eval_candidate_path, name='global_test', query_ann_top_k=10)
     # hitrate_eval, avg_distance = infer.infer()
     # print(f"✅ 验证集评估结果: {hitrate_eval=} {avg_distance=}", )
-    # train_candidate_path = os.path.join(os.environ['TRAIN_DATA_PATH'], 'item_feat_dict.json')
-    # infer = Infer(args, downstream_model, eval_dataset=train_dataset_valid, candidate_path=train_candidate_path, name='global_train', query_ann_top_k=10)
-    # hitrate_train, avg_distance = infer.infer()
-    # print(f"✅ 训练集评估结果: {hitrate_train=} {avg_distance=}", )
+    # train_candidate_path = os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_train.json')
+    # infer = Infer(args, downstream_model, eval_dataset=train_dataset_valid, candidate_path=train_candidate_path, name='train_2', query_ann_top_k=10)
+    # hitrate_train, distance = infer.infer()
+    # print("train:", hitrate_train)
+    
+    # train_candidate_path = os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_train.json')
+    # infer = Infer(args, downstream_model, eval_dataset=train_dataset_valid, candidate_path=train_candidate_path, name='train_2_3', query_ann_top_k=10)
+    # hitrate_train, distance = infer.infer()
+    # print("train:", hitrate_train)
+    # print(f"✅ 训练集评估结果: {hitrate_train=} {distance=}", )
+    
+
     # 清理资源
     writer.close()
 

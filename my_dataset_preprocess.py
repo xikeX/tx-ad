@@ -215,21 +215,50 @@ class MMPBaseDataset():
                 "array_feature": array_feature
             }
         else:
-            idx = self.item_id_to_idx.get(str(item_id))
-            if item_id == 0 or idx==None:
-            # 返回默认值（全 0 或默认 embedding）
+            if use_cache:
+                idx = self.item_id_to_idx.get(str(item_id))
+                if item_id == 0 or idx==None:
+                # 返回默认值（全 0 或默认 embedding）
+                    return {
+                        "sparse_feature": np.zeros(self.sparse_feats.shape[1], dtype=np.int64),
+                        "continual_feature": np.zeros(self.continual_feats.shape[1], dtype=np.float32),
+                        "array_feature": np.zeros(self.array_feats.shape[1], dtype=np.int64),
+                        "mm_emb": self.mm_emb_feats[0]  # 默认 embedding
+                    }
                 return {
-                    "sparse_feature": np.zeros(self.sparse_feats.shape[1], dtype=np.int64),
-                    "continual_feature": np.zeros(self.continual_feats.shape[1], dtype=np.float32),
-                    "array_feature": np.zeros(self.array_feats.shape[1], dtype=np.int64),
-                    "mm_emb": self.mm_emb_feats[0]  # 默认 embedding
+                    "sparse_feature": self.sparse_feats[idx],  # copy 避免 view 被释放
+                    "continual_feature": self.continual_feats[idx],
+                    "array_feature": self.array_feats[idx],
+                    "mm_emb": self.mm_emb_feats[idx]
                 }
-            return {
-                "sparse_feature": self.sparse_feats[idx],  # copy 避免 view 被释放
-                "continual_feature": self.continual_feats[idx],
-                "array_feature": self.array_feats[idx],
-                "mm_emb": self.mm_emb_feats[idx]
-            }
+            else:
+                sparse_feature.append(item_id)
+
+                offset = 0
+                offset += self.itemnum + 1
+                for k in self.ITEM_SPARSE_FEAT:
+                    sparse_feature.append((feat[k]+offset if k in feat else 0))
+                    offset += self.ITEM_SPARSE_FEAT[k] + 1
+                for k in self.ITEM_CONTINUAL_FEAT:
+                    continual_feature.append(feat[k])
+
+                offset = 0
+                for k in self.ITEM_ARRAY_FEAT:
+                    f = [i+offset for i in feat[k][:10]] if k in feat else []
+                    array_feature.extend(f+[0]*(10-len(feat[k])))
+                    offset += self.ITEM_ARRAY_FEAT[k]
+                mm_emb = self.feature_default_value[self.mm_emb_ids[0]]
+                if item_id != 0:
+                    idx = self.item_id_to_idx.get(str(item_id),-1)
+                    if idx !=-1:
+                        mm_emb = self.mm_emb_feats[idx]
+                # return sparse_feature, continual_feature, array_feature, mm_emb
+                return {
+                    "sparse_feature": sparse_feature,
+                    "continual_feature": continual_feature,
+                    "array_feature": array_feature,
+                    "mm_emb": mm_emb
+                }
     
 
     def _process_cold_start_feat(self, feat):
@@ -368,7 +397,7 @@ def process_single_item(args):
         val = feat_dict.get(k, 0)
         sparse_feature.append(val + offset if val else 0)
         offset += vocab_size + 1
-
+#  '118':4,117763, '117':2,58742, '101':5,118509]
     # 3. Continual Features
     for k in config['ITEM_CONTINUAL_FEAT']:
         val = feat_dict.get(k, 0.0)
@@ -414,8 +443,7 @@ def build_feature_file(item_feat_dict, output_path, num_workers=8, config=None):
     max_size = config['itemnum']
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = []
-        for arg in args_list:
-            futures.append(executor.submit(process_single_item, arg))
+        results = list(executor.map(lambda args: process_single_item(*args), args_list))
 
         for future in as_completed(futures):
             idx, item_id, s, c, a, m = future.result()

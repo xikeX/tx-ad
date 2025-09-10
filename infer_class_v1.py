@@ -83,13 +83,17 @@ class Infer:
         max_size = len(self.eval_dataloader)
         
         for step, batch in enumerate(self.eval_dataloader):
+            # with open("t2.pkl",'wb') as f:
+            #     pickle.dump(batch,f) 
             token_type, seq_feat, user_feat, label = \
                 batch['token_type'], batch['seq_feat'], batch['user_feat'], batch['label']
             for m in [seq_feat, user_feat, user_feat]:
                 for k in m:
                     m[k] = m[k].to(self.device)
+            next_action_type = batch['next_action_type'].to(self.device)
             token_type = token_type.to(self.device)
-            logits = self.model.predict(seq_feat, user_feat, token_type)
+            with torch.no_grad():
+                logits = self.model.predict(seq_feat, user_feat, token_type,next_action_type)
             all_embs.append(logits.detach().cpu().numpy().astype(np.float32))
             # user_list.extend(user_id)
             labels.extend([i for i in label])

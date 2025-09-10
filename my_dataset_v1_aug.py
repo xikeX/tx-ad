@@ -62,6 +62,7 @@ class BaseDataset():
         self._init_feat_info_2(feat_statistics=self.feat_statistics, feature_types=self.feature_types)
         self.item_feature_default_value = self.fill_missing_feat({},0,False)
         self.user_feature_default_value = self.fill_missing_feat({},0,True)
+        print("init_finish")
     def _init_feat_info_2(self, feat_statistics, feature_types):
         """
         将特征统计信息（特征数量）按特征类型分组产生不同的字典，方便声明稀疏特征的Embedding Table
@@ -84,7 +85,6 @@ class BaseDataset():
                           "83": 3584, "84": 4096, "85": 3584, "86": 3584}
         self.ITEM_EMB_FEAT = {
             k: EMB_SHAPE_DICT[k] for k in feature_types['item_emb']}  # 记录的是不同多模态特征的维度
-        self.feature_cache = {}
     ## data init
     def _init_feat_info(self):
         """
@@ -198,9 +198,6 @@ class BaseDataset():
                 "array_feature": array_feature
             }
         else:
-            # user_array_feature_range
-            if item_id in self.feature_cache:
-                return self.feature_cache[item_id]
             sparse_feature.append(item_id)
 
             offset = 0
@@ -222,13 +219,6 @@ class BaseDataset():
                     if self.indexer_i_rev[item_id] in self.mm_emb_dict[feat_id]:
                         if type(self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]) == np.ndarray:
                             mm_emb = self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]
-            if use_cache:
-                self.feature_cache[item_id]=    {
-                    "sparse_feature": sparse_feature,
-                    "continual_feature": continual_feature,
-                    "array_feature": array_feature,
-                    "mm_emb": mm_emb
-                }
             # return sparse_feature, continual_feature, array_feature, mm_emb
             return {
                 "sparse_feature": sparse_feature,
@@ -260,7 +250,7 @@ class BaseDataset():
 
 
     ## function_tool
-    def _random_neq(self, l, r, s):
+    def _random_neq(self, l, r, s,feat=None):
         """
         生成一个不在序列s中的随机整数, 用于训练时的负采样
 
@@ -273,8 +263,16 @@ class BaseDataset():
             t: 不在序列s中的随机整数
         """
         t = np.random.randint(l, r)
-        while t in s or str(t) not in self.item_feat_dict:
-            t = np.random.randint(l, r)
+        if feat:
+            cnt=100
+            while cnt>0 and (t in s or str(t) not in self.item_feat_dict or self.item_feat_dict[str(t)].get('112',0)!=feat):
+                t = np.random.randint(l, r)
+                cnt-=1
+                
+        else:
+            while t in s or str(t) not in self.item_feat_dict:
+                t = np.random.randint(l, r)
+            
         return t
 
     def __len__(self):
@@ -347,7 +345,7 @@ class TrainDataset(torch.utils.data.Dataset):
     base_dataset:BaseDataset # 基础数据集（防止深拷贝）
     sample_index:list # 样本索引
     max_padding_size:int # 最大长度
-    def __init__(self, base_dataset, sample_index=[], neg_sample_size = 10, max_padding_size=100):
+    def __init__(self, base_dataset, sample_index=[], neg_sample_size = 1, max_padding_size=100):
         super().__init__()
         self.base_dataset = base_dataset
         self.sample_index = sample_index # 采样索引
@@ -434,10 +432,11 @@ class TrainDataset(torch.utils.data.Dataset):
         # 预处理label，类似于大模型向右填充
         next_i, next_feat, next_type, next_act_type = ext_user_sequence[-1]
         next_feat = self.base_dataset.fill_missing_feat(next_feat, next_i)
+        tag = None
         # left-padding, 从后往前遍历，将用户序列填充到maxlen+1的长度
         for record_tuple in reversed(ext_user_sequence[:-1]):
-            i, feat, type_, act_type = record_tuple
-            feat = self.base_dataset.fill_missing_feat(feat, i)
+            i, dict_feat, type_, act_type = record_tuple
+            feat = self.base_dataset.fill_missing_feat(dict_feat, i)
             token_type[idx] = type_
             next_token_type[idx] = next_type
             if next_act_type is not None:
@@ -452,8 +451,9 @@ class TrainDataset(torch.utils.data.Dataset):
                     next_feat['sparse_feature'], next_feat['continual_feature'], next_feat['array_feature'], next_feat['mm_emb']
                 # 总感觉这样采样不合适，自回归模型基本没有这样采样的方式
                 for j in range( self.neg_sample_size):
-                    neg_id = self.base_dataset._random_neq(1, self.base_dataset.itemnum + 1, ts)
-                    feature_map = self.base_dataset.fill_missing_feat({}, neg_id)
+                    neg_id = self.base_dataset._random_neq(1, self.base_dataset.itemnum + 1, ts,dict_feat.get('112',None))
+                    tag = tag or ts,dict_feat.get('112',None)
+                    feature_map = self.base_dataset.fill_missing_feat({}, neg_id,use_cache=True)
                     position = idx + self.max_padding_size * j
                     neg_feat_sparse[position],neg_feat_continual[position],neg_feat_array[position],neg_feat_mm_embs[position]=\
                         feature_map['sparse_feature'], feature_map['continual_feature'], feature_map['array_feature'], feature_map['mm_emb']
@@ -462,6 +462,14 @@ class TrainDataset(torch.utils.data.Dataset):
             idx -= 1
             if idx == -1:
                 break
+        while idx !=-1:
+            for j in range( self.neg_sample_size):
+                neg_id = self.base_dataset._random_neq(1, self.base_dataset.itemnum + 1, ts,tag)
+                feature_map = self.base_dataset.fill_missing_feat({}, neg_id,use_cache=True)
+                position = idx + self.max_padding_size * j
+                neg_feat_sparse[position],neg_feat_continual[position],neg_feat_array[position],neg_feat_mm_embs[position]=\
+                    feature_map['sparse_feature'], feature_map['continual_feature'], feature_map['array_feature'], feature_map['mm_emb']
+            idx-=1
         
         # seq_feat = np.where(seq_feat == None, self.base_dataset.item_feature_default_value, seq_feat)
         # pos_feat = np.where(pos_feat == None, self.base_dataset.item_feature_default_value, pos_feat)
@@ -592,6 +600,7 @@ class ValidDataset(torch.utils.data.Dataset):
                                   self.base_dataset.item_feature_default_value["array_feature"], dtype=np.int32)
         seq_feat_mm_embs = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["mm_emb"])],
                                   self.base_dataset.item_feature_default_value["mm_emb"], dtype=np.float32)
+        next_action_type = np.zeros([self.max_padding_size + 1], dtype=np.int32)
 
         idx = self.max_padding_size
 
@@ -599,19 +608,22 @@ class ValidDataset(torch.utils.data.Dataset):
         for record_tuple in ext_user_sequence:
             if record_tuple[2] == 1 and record_tuple[0]:
                 ts.add(record_tuple[0])
-
+        _next_action_type=1
         for record_tuple in reversed(ext_user_sequence[:-1]):
-            i, feat, type_,_ = record_tuple
+            i, feat, type_,action_type = record_tuple
             feat = self.base_dataset.fill_missing_feat(feat, i)
             token_type[idx] = type_
             if type_ != 2:
                 seq_feat_sparse[idx], seq_feat_continual[idx], seq_feat_array[idx], seq_feat_mm_embs[idx] = \
                     feat["sparse_feature"], feat["continual_feature"], feat["array_feature"], feat["mm_emb"]
+            if _next_action_type:
+                next_action_type[idx]=_next_action_type
+            _next_action_type=action_type
             idx -= 1
             if idx == -1:
                 break
         label = ext_user_sequence[-1][0]
-        return token_type, seq_feat_sparse,seq_feat_continual,seq_feat_array, seq_feat_mm_embs, user_sparse_feature, user_continual_feature, user_array_feature, label
+        return token_type,next_action_type, seq_feat_sparse,seq_feat_continual,seq_feat_array, seq_feat_mm_embs, user_sparse_feature, user_continual_feature, user_array_feature, label
     
     
     @staticmethod
@@ -629,8 +641,9 @@ class ValidDataset(torch.utils.data.Dataset):
             user_id: user_id, str
         """
         return_batch = {}
-        token_type, seq_feat_sparse,seq_feat_continual,seq_feat_array, seq_feat_mm_embs, user_sparse_feature, user_continual_feature, user_array_feature, label = zip(*batch)
+        token_type,next_action_type, seq_feat_sparse,seq_feat_continual,seq_feat_array, seq_feat_mm_embs, user_sparse_feature, user_continual_feature, user_array_feature, label = zip(*batch)
         return_batch['token_type'] = torch.from_numpy(np.array(token_type))
+        return_batch['next_action_type']=torch.from_numpy(np.array(next_action_type))
         return_batch['seq_feat'] = {
             "item_sparse_feature": torch.from_numpy(np.stack(seq_feat_sparse, axis=0)),
             "item_continual_feature": torch.from_numpy(np.stack(seq_feat_continual, axis=0)),
@@ -653,7 +666,7 @@ class EmbeddingDataset(torch.utils.data.IterableDataset):
     max_padding_size:int # 最大长度
     feature_map:dict
 
-    def __init__(self, base_dataset, sample_index=[], max_padding_size=100, neg_sample_size = 100, max_cache_size=100000):
+    def __init__(self, base_dataset, sample_index=[], max_padding_size=100, neg_sample_size = 10, max_cache_size=100000):
         super().__init__()
         self.base_dataset = base_dataset
         self.sample_index = sample_index # 采样索引
@@ -731,7 +744,7 @@ class EmbeddingDataset(torch.utils.data.IterableDataset):
                         # 难样本
                         neg1 = random.choice(explore_item_sequence)
                     if neg1 not in self.feature_map:
-                        self.feature_map[neg1] = self.base_dataset.fill_missing_feat(self.base_dataset.item_feat_dict[str(neg1)],neg1,use_cache=True)
+                        self.feature_map[neg1] = self.base_dataset.fill_missing_feat(self.base_dataset.item_feat_dict[str(neg1)],neg1)
                     neg1_list.append(neg1)
                 data_pairs.append((cur_u, pos1, pos2, neg1_list))
             self.cache.extend(data_pairs)
