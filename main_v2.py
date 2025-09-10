@@ -1,9 +1,10 @@
-# main.py
+# main_v2.py
 from collections import defaultdict
 from datetime import datetime
 import os
-
-from infer_class import Infer
+import shutil
+from torch.cuda.amp import autocast, GradScaler
+from infer_class_v1 import Infer
 if os.environ.get("DEBUG_MODE","") == 'True':
     print("in debug model")
     os.environ['TRAIN_LOG_PATH']='./log_path'
@@ -11,10 +12,12 @@ if os.environ.get("DEBUG_MODE","") == 'True':
     os.environ['TRAIN_DATA_PATH']='./TencentGR_1k'
     os.environ['TRAIN_CKPT_PATH']='./checkpoint'
     os.environ['USER_CACHE_PATH']='./user_cache_file'
+    os.makedirs(os.environ['USER_CACHE_PATH'], exist_ok = True)
     os.environ['DEBUG_MODE'] = 'True'
     # 设置单GPU
 import os
 from transformers import get_cosine_schedule_with_warmup
+from transformers.optimization import get_cosine_with_min_lr_schedule_with_warmup,get_linear_schedule_with_warmup
 # 获取当前目录（'.'）的绝对路径
 current_abs_path = os.path.abspath('./temp')
 os.environ['TEMP_PATH'] = current_abs_path
@@ -45,10 +48,10 @@ torch.backends.cuda.matmul.allow_tf32 = True
 # The flag below controls whether to allow TF32 on cuDNN. This flag defaults to True.
 torch.backends.cudnn.allow_tf32 = True
 # 自定义模块
-from my_dataset import BaseDataset, TrainDataset, EmbeddingDataset, ValidDataset
+from my_dataset_v1 import BaseDataset, TrainDataset, EmbeddingDataset, ValidDataset
 from split_embedding_model import ADEmbeddingLayer as EmbeddingModel
 # from split_embedding_model import BaselineModel as DownstreamModel
-from baseline_model import BaselineModel as DownstreamModel
+from baseline_model_v4_ctcvr_v2 import BaselineModel as DownstreamModel
 from transformers import get_cosine_schedule_with_warmup
 import torch
 import torch.nn as nn
@@ -82,13 +85,14 @@ def get_args():
     parser.add_argument('--batch_size', type=int, default=32, help='训练/验证批大小')
     parser.add_argument('--embedding_batch_size', type=int, default=64, help='训练 embedding 的批大小')
     parser.add_argument('--maxlen', type=int, default=101, help='序列最大长度')
-    parser.add_argument('--num_worker', type=int, default=2, help='序列最大长度')
+    parser.add_argument('--num_worker', type=int, default=0, help='序列最大长度')
+    parser.add_argument('--train_name',type=str, default="v2", help='训练名称')
 
     # ================== 模型结构参数 ==================
-    parser.add_argument('--hidden_units', type=int, default=32, help='隐藏层维度')
-    parser.add_argument('--num_blocks', type=int, default=1, help='Transformer 块数')
+    parser.add_argument('--hidden_units', type=int, default=64, help='隐藏层维度')
+    parser.add_argument('--num_blocks', type=int, default=4, help='Transformer 块数')
     parser.add_argument('--num_heads', type=int, default=4, help='多头注意力头数')
-    parser.add_argument('--dropout_rate', type=float, default=0.1, help='Dropout 比例')
+    parser.add_argument('--dropout_rate', type=float, default=0.2, help='Dropout 比例')
     parser.add_argument('--l2_emb', type=float, default=0.0, help='嵌入层 L2 正则强度')
     parser.add_argument('--norm_first', action='store_true', help='是否在 Transformer 中先归一化（Pre-LN）')
     parser.add_argument('--mm_emb_id', nargs='+', type=str, default=['81'],
@@ -96,7 +100,7 @@ def get_args():
                         help='多模态嵌入特征 ID 列表')
 
     # ================== 训练优化参数 ==================
-    parser.add_argument('--num_epochs', type=int, default=25, help='训练总轮数')
+    parser.add_argument('--num_epochs', type=int, default=10, help='训练总轮数')
     parser.add_argument('--embedding_task_lr', type=float, default=1e-3, help='embedding 任务学习率')
     parser.add_argument('--downstream_task_lr', type=float, default=1e-2, help='下游任务学习率')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='权重衰减（AdamW 等优化器使用）')
@@ -172,40 +176,59 @@ def train_downstream_model(model, train_loader, valid_loader, args, writer, test
     scheduler = None
     if args.use_lr_scheduler_in_downstream:
         total_steps = args.num_epochs * len(train_loader)
-        scheduler = get_cosine_schedule_with_warmup(
+        # scheduler = get_cosine_schedule_with_warmup(
+        #     optimizer,
+        #     num_warmup_steps=total_steps*0.01,           # 例如：1000 步 warm-up
+        #     num_training_steps=total_steps   # 总训练步数
+        # )
+        scheduler = get_cosine_with_min_lr_schedule_with_warmup(
             optimizer,
             num_warmup_steps=total_steps*0.01,           # 例如：1000 步 warm-up
-            num_training_steps=total_steps   # 总训练步数
+            num_training_steps=total_steps,   # 总训练步数,
+            min_lr = 1e-5,
         )
-    best_hitrate = float('inf')  # ✅ 记录最佳验证损失
+    best_hitrate = -float('inf')  # ✅ 记录最佳验证损失
     no_improve_count = 0
+    
+    # model.special_embedding_apply()
 
-    model.special_embedding_apply()
+    # if os.environ.get('DEBUG_MODE',"")=="True":
+    #     model = torch.compile(model, backend='aot_eager')
+    # else:
+    # model = torch.compile(model)
+
+    scaler = torch.amp.GradScaler("cuda") if os.environ.get("DEBUG_MODE","")=="True" else None
     for epoch in range(1, args.num_epochs + 1):
         model.train()
         t0 = time.time()
         total_loss_epoch = 0.0
 
         start_time = round(time.time())
-        print("start time",start_time)
         for step, batch in enumerate(train_loader):
             # 解包数据
-            seq, pos, neg, token_type, next_token_type, next_action_type, \
-            seq_feat, pos_feat, neg_feat = batch
+            # seq, pos, neg, token_type, next_token_type, next_action_type, \
+            # seq_feat, pos_feat, neg_feat = batch['seq'], batch['pos'], batch['neg'], batch['token_type'], batch['next_token_type'], batch['next_action_type'], batch['seq_feat'], batch['pos_feat'], batch['neg_feat']
+            token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, user_feat = \
+                batch['token_type'], batch['next_token_type'], batch['next_action_type'], batch['seq_feat'], batch['pos_feat'], batch['neg_feat'], batch['user_feat']
             # 移动到设备
-            seq = seq.to(args.device)
-            pos = pos.to(args.device)
-            neg = neg.to(args.device)
-            token_type = token_type.to(args.device)
-            next_token_type = next_token_type.to(args.device)
-            next_action_type = next_action_type.to(args.device)
-
-            # 前向传播
-            output = model(
-                seq, pos, neg, token_type, next_token_type, next_action_type,
-                seq_feat, pos_feat, neg_feat
-            )
-            total_loss = output['total_loss'] 
+            token_type, next_token_type, next_action_type = token_type.to(args.device), next_token_type.to(args.device), next_action_type.to(args.device)
+            for m in [seq_feat, pos_feat, neg_feat, user_feat]:
+                for k in m:
+                    m[k] = m[k].to(args.device)
+            if scaler:
+                with torch.amp.autocast('cuda'):
+                    output = model(
+                        token_type, next_token_type, next_action_type,
+                        seq_feat, pos_feat, neg_feat, user_feat
+                    )
+                    total_loss = output['total_loss'] 
+            else:
+                # 前向传播
+                output = model(
+                    token_type, next_token_type, next_action_type,
+                    seq_feat, pos_feat, neg_feat,user_feat
+                )
+                total_loss = output['total_loss'] 
 
             # L2 正则化（仅 item_emb）
             if args.l2_emb > 0:
@@ -213,25 +236,38 @@ def train_downstream_model(model, train_loader, valid_loader, args, writer, test
                 for param in model.item_emb.parameters():
                     l2_reg += torch.norm(param)
                 total_loss += args.l2_emb * l2_reg
+            if scaler:
+                optimizer.zero_grad()
+                # 反向传播（自动缩放梯度）
+                scaler.scale(total_loss).backward()
 
-            # ✅ 检查损失是否为 NaN 或 Inf
-            if torch.isnan(total_loss) or torch.isinf(total_loss):
-                print(f"❌ 跳过 batch，损失异常（NaN/Inf） at epoch {epoch}, step {step}")
-                continue
+                # ✅ 梯度裁剪（必须先 unscale）
+                # scaler.unscale_(optimizer)
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                for name, param in model.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        writer.add_scalar("GRAD/"+name + '_grad', param.grad.norm(), global_step)
+                # 更新参数
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.zero_grad()
+                # ✅ 检查损失是否为 NaN 或 Inf
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"❌ 跳过 batch，损失异常（NaN/Inf):{total_loss} at epoch {epoch}, step {step}")
+                    continue
 
-            # 反向传播
-            optimizer.zero_grad()
-            total_loss.backward()
+                # 反向传播
+                total_loss.backward()
 
-            # ✅ 梯度裁剪（防止梯度爆炸）
-            # if epoch>30:
-            #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # 输出所有层的梯度到writer
-            # for name, param in model.named_parameters():
-            #     if param.requires_grad and param.grad is not None:
-            #         writer.add_scalar(name + '_grad', param.grad.norm(), global_step)
-            optimizer.step()
+                # ✅ 梯度裁剪（防止梯度爆炸）
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # 输出所有层的梯度到writer
+                for name, param in model.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        writer.add_scalar("GRAD/"+name + '_grad', param.grad.norm(), global_step)
+                optimizer.step()
             if scheduler:
                 scheduler.step()
 
@@ -267,18 +303,18 @@ def train_downstream_model(model, train_loader, valid_loader, args, writer, test
         val_batches = 0
         with torch.no_grad():
             for batch in tqdm(valid_loader, desc="Validation", leave=False):
-                seq, pos, neg, token_type, next_token_type, next_action_type, \
-                seq_feat, pos_feat, neg_feat = batch
-
-                seq, pos, neg, next_token_type, next_action_type = \
-                    seq.to(args.device), pos.to(args.device), neg.to(args.device), next_token_type.to(args.device), next_action_type.to(args.device)
-                
+                token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, user_feat = \
+                batch['token_type'], batch['next_token_type'], batch['next_action_type'], batch['seq_feat'], batch['pos_feat'], batch['neg_feat'], batch['user_feat']
+                # 移动到设备
+                token_type, next_token_type, next_action_type = token_type.to(args.device), next_token_type.to(args.device), next_action_type.to(args.device)
+                for m in [seq_feat, pos_feat, neg_feat, user_feat]:
+                    for k in m:
+                        m[k] = m[k].to(args.device)
+                # 前向传播
                 output = model(
-                    seq, pos, neg, token_type, next_token_type, next_action_type,
-                    seq_feat, pos_feat, neg_feat
+                    token_type, next_token_type, next_action_type,
+                    seq_feat, pos_feat, neg_feat,user_feat
                 )
-                total_loss = output['total_loss']
-                record['total_loss'] = total_loss.item()
                 if hasattr(model,'eval_record'):
                     for record_key in model.eval_record:
                         record[record_key] += output[record_key]
@@ -291,33 +327,38 @@ def train_downstream_model(model, train_loader, valid_loader, args, writer, test
         # # ✅ 保存最佳模型
 
         if test_dataset:
-            eval_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_eval.json')
-            infer = Infer(args, model, eval_dataset=test_dataset, candidate_path=eval_candidate_path)
+            eval_candidate_path = os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_eval.json')
+            infer = Infer(args, model, eval_dataset=test_dataset, candidate_path=eval_candidate_path,name='eval',query_ann_top_k=10)
             hitrate_eval = infer.infer()
             # 输出结果
             print("✅ 评估结果")
             print("eval:", hitrate_eval)
             writer.add_scalar('HitRat/eval', hitrate_eval, global_step)
 
-        ckpt_dir = Path(os.environ.get('TRAIN_CKPT_PATH')) / f"global_step{global_step}.hitrate={hitrate_eval:.4f}"
-        if hitrate_eval < best_hitrate:
-            best_hitrate = record['total_loss']
+        if hitrate_eval > best_hitrate:
+            best_hitrate = hitrate_eval
             no_improve_count = 0
-            user_dir = Path(os.environ.get('USER_CACHE_PATH')) / f"global_step{global_step}.hitrate={hitrate_eval:.4f}"
-            for save_dir in [ckpt_dir, user_dir]:
-                save_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(model.state_dict(), save_dir / "model.pt")
-                print(f"✅ 最佳模型已保存至: {save_dir / 'model.pt'}")
-        else:
-            ckpt_dir = Path(os.environ.get('TRAIN_CKPT_PATH')) / f"global_step{global_step}.hitrate={hitrate_eval:.4f}"
+            save_dir = Path(os.environ.get('USER_CACHE_PATH')) /args.train_name 
+            # 删除旧的模型文件
+            if os.path.exists(save_dir) and  len(os.listdir(save_dir))!=0:
+                for folder in os.listdir(save_dir):
+                    folder = os.path.join(save_dir, folder)
+                    if os.path.isdir(folder):
+                        shutil.rmtree(folder)
+            save_dir = save_dir/f"global_step_best_model_{epoch}"
             save_dir.mkdir(parents=True, exist_ok=True)
-            no_improve_count += 1
             torch.save(model.state_dict(), save_dir / "model.pt")
-            print(f"✅ 模型已保存至: {save_dir / 'model.pt'}")
+            print(f"✅ 最佳模型已保存至: {save_dir / 'model.pt'}")
+
+        save_dir = Path(os.environ.get('TRAIN_CKPT_PATH')) / f"global_step{global_step}.hitrate={hitrate_eval:.4f}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        no_improve_count += 1
+        torch.save(model.state_dict(), save_dir / "model.pt")
+        print(f"✅ 模型已保存至: {save_dir / 'model.pt'}")
 
         if test_dataset_2 and os.environ.get("DEBUG_MODE","")=="True":
-            train_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_train.json')
-            infer = Infer(args, model, eval_dataset=test_dataset_2, candidate_path=train_candidate_path)
+            train_candidate_path = os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_train.json')
+            infer = Infer(args, model, eval_dataset=test_dataset_2, candidate_path=train_candidate_path,name='train',query_ann_top_k=10)
             hitrate_train = infer.infer()
             print("train:", hitrate_train)
             # 写入writer
@@ -363,29 +404,32 @@ def main():
     eval_candidate_index = []
     # 获取测试集的标签
     print("获取测试集的标签...")
-    
-    for item in test_dataset:
-        seq, token_type, seq_feat, user_id, label = item
-        eval_candidate_index.append(label[0])
-    res_eval_condidate_data = {}
-    for item in eval_candidate_index:
-        res_eval_condidate_data[str(item)] = condidate_data[str(item)]
-    json.dump(res_eval_condidate_data, fp=open(os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_eval.json'),'w',encoding='utf-8'),indent=4, ensure_ascii=False)
-    json.dump(res_eval_condidate_data, fp=open(os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_eval.json'),'w',encoding='utf-8'),indent=4, ensure_ascii=False)
-    eval_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_eval.json')
+    if os.path.exists(os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_eval.json')):
+        eval_candidate_path = os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_eval.json')
+    else:
+        for item in test_dataset:
+            eval_candidate_index.append(item[-1][0])
+        res_eval_condidate_data = {}
+        for item in eval_candidate_index:
+            res_eval_condidate_data[str(item)] = condidate_data[str(item)]
+        json.dump(res_eval_condidate_data, fp=open(os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_eval.json'),'w',encoding='utf-8'),indent=4, ensure_ascii=False)
+        json.dump(res_eval_condidate_data, fp=open(os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_eval.json'),'w',encoding='utf-8'),indent=4, ensure_ascii=False)
+        eval_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_eval.json')
     print("获取测试集候选数据完成")
     train_candidate_path = None
     print("开始获取训练集候选数据")
-    eval_candidate_index = []
-    for item in test_dataset_2:
-        seq, token_type, seq_feat, user_id, label = item
-        eval_candidate_index.append(label[0])
-    res_eval_condidate_data = {}
-    for item in eval_candidate_index:
-        res_eval_condidate_data[str(item)] = condidate_data[str(item)]
-    json.dump(res_eval_condidate_data, fp=open(os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_train.json'),'w',encoding='utf-8'),indent=4, ensure_ascii=False)
-    json.dump(res_eval_condidate_data, fp=open(os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_train.json'),'w',encoding='utf-8'),indent=4, ensure_ascii=False)
-    train_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_train.json')
+    if os.path.exists(os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_train.json')):
+        eval_candidate_path = os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_train.json')
+    else:
+        eval_candidate_index = []
+        for item in test_dataset_2:
+            eval_candidate_index.append(item[-1][0])
+        res_eval_condidate_data = {}
+        for item in eval_candidate_index:
+            res_eval_condidate_data[str(item)] = condidate_data[str(item)]
+        json.dump(res_eval_condidate_data, fp=open(os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_train.json'),'w',encoding='utf-8'),indent=4, ensure_ascii=False)
+        json.dump(res_eval_condidate_data, fp=open(os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_train.json'),'w',encoding='utf-8'),indent=4, ensure_ascii=False)
+        train_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_train.json')
     print("获取训练集候选数据完成")
 
     print("数据集准备完成，继续下游任务训练...")
@@ -399,9 +443,9 @@ def main():
         shuffle=False,
         collate_fn=train_dataset.collate_fn,
         pin_memory=True,
-        num_workers=args.num_worker if args.num_worker > 0 else 0,
-        persistent_workers = True if args.num_worker > 0 else False,
-        prefetch_factor=5 if args.num_worker > 0 else None,
+        num_workers=args.num_worker,
+        persistent_workers = True if args.num_worker!=0 else False,
+        prefetch_factor=5 if args.num_worker!=0 else None,
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -409,9 +453,9 @@ def main():
         shuffle=False,
         collate_fn=valid_dataset.collate_fn,
         pin_memory=True,
-        num_workers=args.num_worker if args.num_worker > 0 else 0,
-        persistent_workers = True if args.num_worker > 0 else False,
-        prefetch_factor=5 if args.num_worker > 0 else None,
+        num_workers=args.num_worker,
+        persistent_workers = True if args.num_worker!=0 else False,
+        prefetch_factor=5 if args.num_worker!=0 else None,
     )
 
     # 模型初始化
@@ -429,18 +473,27 @@ def main():
 
     # 开始训练
     train_downstream_model(downstream_model, train_loader, valid_loader, args, writer,test_dataset, test_dataset_2)
-    eval_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_eval.json')
-    infer = Infer(args, downstream_model, eval_dataset=test_dataset, candidate_path=eval_candidate_path)
+    best_model_path = None
+    try:
+        # 查看该文件加下的唯一模型Path(os.environ.get('USER_CACHE_PATH')) /args.train_name
+        best_model_path = Path(os.environ.get('USER_CACHE_PATH')) /args.train_name
+        sub_path = os.listdir(best_model_path)[0]
+        best_model_path = best_model_path / sub_path /"model.pt"
+        downstream_model.load_state_dict(torch.load(best_model_path))
+        print(f"✅ 加载最佳模型权重: {best_model_path}")
+    except Exception as e:
+        print(f"⚠️ 权重加载失败: {e}")
+    eval_candidate_path = os.path.join(os.environ['TRAIN_DATA_PATH'], 'item_feat_dict.json')
+    infer = Infer(args, downstream_model, eval_dataset=test_dataset, candidate_path=eval_candidate_path,name='global_test',query_ann_top_k=10)
     hitrate_eval = infer.infer()
-    print("✅ 推理完成")
-    train_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_train.json')
-    infer = Infer(args, downstream_model, eval_dataset=test_dataset_2, candidate_path=train_candidate_path)
-    hitrate_train = infer.infer()
-
-    # 输出结果
     print("✅ 评估结果")
     print("eval:", hitrate_eval)
+    train_candidate_path = os.path.join(os.environ['TRAIN_DATA_PATH'], 'item_feat_dict.json')
+    infer = Infer(args, downstream_model, eval_dataset=test_dataset_2, candidate_path=train_candidate_path,name='global_train',query_ann_top_k=10)
+    hitrate_train = infer.infer()
+    # 输出结果
     print("train:", hitrate_train)
+    print("✅ 推理完成")
     # 清理资源
     writer.close()
     
@@ -448,12 +501,29 @@ if __name__ == '__main__':
     main()
 
 
-# eval: 0.47674418604651164
-# train: 0.3856041131105398
-# Epoch 9 | Train Loss: 3.5280 | Time: 15.93s
+# v1 baseline
+# 1 1 32
+# best epoch 2
+# eval: 0.011627906976744186
+# train: 0.007712082262210797
 
 
-# -105  特征
-# eval: 0.5116279069767442
-# train: 0.794344473007712
-# Epoch 13 | Train Loss: 2.5730 | Time: 16.76sp
+# v1 baseline
+# 4 4 64
+# best epoch 3
+# eval: 0.0
+# train: 0.007712082262210797
+
+
+# v4 ctcvr 方式
+# 4 4 64
+# eval: 0.011627906976744186
+# train: 0.002570694087403599
+# ✅ 最佳模型: user_cache_file\v2\global_step_best_model_2\model.pt
+
+
+# v4 ctcvr v2
+# 4 4 64
+# eval: 0.0
+# train: 0.005141388174807198
+# ✅ 最佳模型: user_cache_file\v2\global_step_best_model_1\model.pt

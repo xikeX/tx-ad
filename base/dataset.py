@@ -1,4 +1,5 @@
 import json
+import os
 import pickle
 import struct
 from pathlib import Path
@@ -6,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
-import os
+
 
 class MyDataset(torch.utils.data.Dataset):
     """
@@ -53,12 +54,8 @@ class MyDataset(torch.utils.data.Dataset):
         self.indexer = indexer
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
-        self.sample_index = []
-        self.total_data_size = len(self.seq_offsets)
-        
-    def set_sample(self,sample_index):
-        self.sample_index = sample_index
-        
+        self.sample_index = None
+
     def _load_data_and_offsets(self):
         """
         加载用户序列数据和每一行的文件偏移量(预处理好的), 用于快速随机访问数据并I/O
@@ -182,9 +179,7 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             usernum: 用户数量
         """
-        assert len(self.sample_index)!=0,'please set sample index fisrt'
-        if len(self.sample_index):
-            return len(self.sample_index)
+        return len(self.sample_index)
 
     def _init_feat_info(self):
         """
@@ -352,7 +347,7 @@ class MyTestDataset(MyDataset):
 
         ext_user_sequence = []
         for record_tuple in user_sequence:
-            u, i, user_feat, item_feat, _, _ = record_tuple
+            u, i, user_feat, item_feat, action_type, _ = record_tuple
             if u:
                 if type(u) == str:  # 如果是字符串，说明是user_id
                     user_id = u
@@ -363,7 +358,7 @@ class MyTestDataset(MyDataset):
                     u = 0
                 if user_feat:
                     user_feat = self._process_cold_start_feat(user_feat)
-                ext_user_sequence.insert(0, (u, user_feat, 2))
+                ext_user_sequence.insert(0, (u, user_feat, 2, action_type))
 
             if i and item_feat:
                 # 序列对于训练时没见过的item，不会直接赋0，而是保留creative_id，creative_id远大于训练时的itemnum
@@ -371,8 +366,13 @@ class MyTestDataset(MyDataset):
                     i = 0
                 if item_feat:
                     item_feat = self._process_cold_start_feat(item_feat)
-                ext_user_sequence.append((i, item_feat, 1))
-
+                ext_user_sequence.append((i, item_feat, 1,action_type))
+        last_index_action_type_eq_1 = None
+        for index,item in enumerate(ext_user_sequence):
+            if item[-1]==1:
+                last_index_action_type_eq_1=index
+        if last_index_action_type_eq_1:
+            ext_user_sequence = ext_user_sequence[:last_index_action_type_eq_1+1]
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
         seq_feat = np.empty([self.maxlen + 1], dtype=object)
@@ -385,7 +385,7 @@ class MyTestDataset(MyDataset):
                 ts.add(record_tuple[0])
 
         for record_tuple in reversed(ext_user_sequence[:-1]):
-            i, feat, type_ = record_tuple
+            i, feat, type_,_ = record_tuple
             feat = self.fill_missing_feat(feat, i)
             seq[idx] = i
             token_type[idx] = type_
@@ -403,6 +403,8 @@ class MyTestDataset(MyDataset):
         Returns:
             len(self.seq_offsets): 用户数量
         """
+        # with open(Path(self.data_dir, 'predict_seq_offsets.pkl'), 'rb') as f:
+        #     temp = pickle.load(f)
         return len(self.sample_index)
 
     @staticmethod
@@ -438,10 +440,10 @@ def save_emb(emb, save_path):
     num_points = emb.shape[0]  # 数据点数量
     num_dimensions = emb.shape[1]  # 向量的维度
     print(f'saving {save_path}')
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     with open(Path(save_path), 'wb') as f:
         f.write(struct.pack('II', num_points, num_dimensions))
         emb.tofile(f)
+
 
 
 def load_mm_emb(mm_path, feat_ids):
@@ -475,20 +477,23 @@ def load_mm_emb(mm_path, feat_ids):
             except Exception as e:
                 print(f"transfer error: {e}")
         if feat_id == '81':
-            file = Path(mm_path, f'emb_{feat_id}_{shape}.pkl')
-            if file.exists():
-                with open(file, 'rb') as f:
+            file_path = Path(mm_path, f'emb_{feat_id}.pkl')
+            if os.path.exists(file_path):
+                with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
                     emb_dict = pickle.load(f)
             else:
-                folder = Path(mm_path, f'emb_{feat_id}_{shape}')
-                files = [os.path.join(folder,f) for f in os.listdir(folder)]
-                emb_dict = {}
+                folder = Path(mm_path, f'emb_{feat_id}_32')
+                files = os.listdir(folder)
                 for file in files:
-                    with open(file,'r',encoding='utf-8') as f:
+                    path = Path(folder, file)
+                    with open(path,'r',encoding='utf-8') as f:
                         for line in f:
-                            item = json.loads(line)
-                            if 'emb' in item:
-                                emb_dict[item['anonymous_cid']]=torch.tensor(item['emb'])
+                            line = json.loads(line)
+                            if 'emb' in line:
+                                emb_dict[line['anonymous_cid']] = np.array(line['emb'])
         mm_emb_dict[feat_id] = emb_dict
         print(f'Loaded #{feat_id} mm_emb')
     return mm_emb_dict
+
+
+# dataset.py
